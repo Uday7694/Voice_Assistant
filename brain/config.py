@@ -31,6 +31,17 @@ DEEP_REASON_ENABLED = os.getenv("DEEP_REASON_ENABLED", "").strip().lower() in {
     "on",
 }
 
+# Once a call has a language, keep it.
+#
+# The alternative — following whoever is speaking — sounds right and behaves badly. A
+# Hindi caller who says one English word ("appointment", "booking", "OK") flips the
+# whole call to English, and because the agent is then speaking English the caller
+# often answers in English too, so it never flips back. Romanised Hindi makes it worse:
+# "mera naam amit hai" is ASCII and reads as English to a classifier.
+#
+# Set LANGUAGE_FOLLOWS_CALLER=1 for the old behaviour, per deployment.
+LOCK_LANGUAGE = os.getenv("LANGUAGE_FOLLOWS_CALLER", "").strip() not in {"1", "true", "yes", "on"}
+
 # Conversation limits enforced in code, never in the prompt.
 MAX_TURNS_PER_SESSION = 40
 MAX_CONSECUTIVE_NO_MATCH = 2

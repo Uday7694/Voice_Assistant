@@ -22,9 +22,9 @@ The whole thing hangs on one number: **under 1000 ms from the caller going silen
 first byte of audio coming back.** Past that, people talk over the agent and the illusion
 dies. Every design decision in this repo is downstream of that budget.
 
-The locked stack is **Sarvam AI** (STT/TTS, Indian languages), **Groq** (conversational
-LLM), **LiveKit** (media), **Exotel** (PSTN). Full rationale in
-[BLUEPRINT.md](BLUEPRINT.md).
+The stack is **Sarvam AI** (streaming STT/TTS and the conversational LLM), **Groq**
+(intent classification and failover),
+**LiveKit** (media), **Exotel** (PSTN). Full rationale in [BLUEPRINT.md](BLUEPRINT.md).
 
 ### The differentiator
 
@@ -48,18 +48,27 @@ core is real, tested, and measured. The media, web, and telephony layers do not 
 | **L2 Dialogue** | Flow graph + planner, sentence-boundary streaming. |
 | **L3 Tools** | Timeout-bounded registry with spoken fallbacks. Canned data. |
 | **L5 Guardrails** | Inbound emergency/injection screen, outbound clinical screen. |
-| **Providers** | Groq primary, NVIDIA NIM failover, both latency-measured. |
+| **Providers** | Sarvam planner, Groq classifier + failover, NVIDIA spare. |
 | **Deep reasoning** | Optional background subagent. Off by default. |
+| **Speech** | Sarvam streaming STT/TTS. Verified live in Hindi and Telugu. |
 
 **92 tests passing.** `voice_sim.py` runs a full simulated call — real brain, real turn
 taking, printed frames instead of sound.
 
 ### Written but unverified
 
-- **L1/L6 Speech** (`brain/speech/sarvam.py`) — Sarvam STT/TTS client, written without a
-  key and never run against the live service. The wire format is loosely documented, so
-  parsing reads defensively by attribute. Add `SARVAM_API_KEY` and run
-  `python probe_sarvam.py` to find out what actually breaks.
+Neither speech provider has been run against its live service — both were written from
+docs, without credentials. Payload parsing reads defensively on both paths.
+
+- **Sarvam** (`brain/speech/sarvam.py`) — the default. Streams both directions over
+  WebSockets: VAD signals arrive while the caller is still talking, which is what drives
+  barge-in, and TTS audio arrives frame by frame. Set `SARVAM_API_KEY`, then
+  `python probe_sarvam.py`.
+
+Every argument the Sarvam adapter passes is checked against the installed SDK signature
+by the test suite, so an SDK upgrade that renames a parameter fails in CI rather than at
+the first spoken word.
+
 
 ### Not started
 
@@ -85,8 +94,10 @@ the biggest single cost and may be foldable into the planner call.
 
 Ordered by what unblocks the most.
 
-**1. Verify the speech layer.** Get a Sarvam key, run `probe_sarvam.py`, fix the parsing.
-Everything downstream assumes this works and nothing has proven it does.
+**1. Get a Sarvam key and verify the speech layer.** Run `probe_sarvam.py`, fix whatever
+the live wire format disagrees with. This is now the critical-path blocker: the default
+provider cannot speak without it. Then tune `SARVAM_MIN_BUFFER_SIZE` against real
+time-to-first-audio.
 
 **2. Measure from Mumbai.** Every latency number here is from a Windows box on the wrong
 side of the planet. The budget is meaningless until it is measured where it will run.
@@ -158,10 +169,27 @@ against the live API.
 |---|---|---|
 | `GROQ_API_KEY` | — | Required. Drives live conversation. |
 | `NVIDIA_API_KEY` | — | Optional. Dev provider, Groq failover, deep reasoning. |
-| `SARVAM_API_KEY` | — | Needed to verify the speech layer. |
+| `SARVAM_MIN_BUFFER_SIZE` | `24` | Chars buffered before synthesis starts. Main lever on first-audio latency. |
+| `SARVAM_MAX_CHUNK_LENGTH` | `150` | Cap on one synthesis burst. |
+| `SARVAM_API_KEY` | — | Speech **and** the planner LLM — one shared credit balance. |
+| `LLM_PROVIDER` | `sarvam` | Who writes what the caller hears. |
+| `FAST_LLM_PROVIDER` | `groq` | Intent classification only. Keep off Sarvam to halve credit use. |
 | `DEEP_REASON_ENABLED` | `false` | Opt in to the slow reasoning tier. |
 | `SUBAGENT_MODEL` | `minimaxai/minimax-m3` | Deep-reasoning model. |
 | `SUBAGENT_FALLBACK_MODEL` | `moonshotai/kimi-k3` | Tried when the primary fails. |
+
+### Why the LLM is split across two providers
+
+`sarvam-105b-conversations` writes the replies. It is trained on the ten Indian
+languages this agent speaks, and in Telugu it produces flow-appropriate phrasing —
+honorifics included — where the gpt-oss models produce translated-sounding English.
+Streaming and tool calling both work; verified live.
+
+Intent classification stays on Groq. Its output is a JSON label nobody ever hears, Groq
+handles Telugu classification correctly, and it is roughly 3x faster (1.1-2.3 s on
+Sarvam against 0.3-0.6 s on Groq). It also matters commercially: **Sarvam bills LLM
+calls against the same credit balance as speech**, so classifying there would spend the
+budget twice a turn on the half the caller cannot hear.
 
 ### Deep reasoning is opt-in
 
@@ -201,3 +229,4 @@ does not un-leak it.
 | [BLUEPRINT.md](BLUEPRINT.md) | System architecture, latency budget, phased plan, stack rationale |
 | [BRAIN.md](BRAIN.md) | Conversation core internals, design decisions, known gaps |
 | [VOICE_APIS.md](VOICE_APIS.md) | Sarvam STT/TTS API notes |
+

@@ -21,7 +21,7 @@ from enum import Enum
 from typing import AsyncIterator, Protocol
 
 from ..models import EndEvent, EscalateEvent, SayEvent
-from ..speech.sarvam import SpeechEvent
+from ..speech.types import SpeechEvent
 
 log = logging.getLogger(__name__)
 

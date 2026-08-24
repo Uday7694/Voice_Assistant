@@ -16,7 +16,9 @@ HOSPITAL_AGENT = Agent(
         "warm, brisk, and respectful. Callers may speak English, Hindi, or a mix of both; "
         "you will be told which language to use on each turn."
     ),
-    languages=("en-IN", "hi-IN"),
+    # A language must be listed here before the agent will switch into it: the language
+    # settler only accepts a detected language that the agent declares.
+    languages=("en-IN", "hi-IN", "te-IN"),
     entry_node="greet",
     guardrail_topics=(
         "medical advice, diagnosis, symptoms, or medication",
@@ -28,13 +30,27 @@ HOSPITAL_AGENT = Agent(
         Node(
             id="greet",
             goal="Greet the caller in one short line and ask how you can help.",
-            expected_intents=("book_appointment", "check_appointment", "reschedule"),
+            expected_intents=(
+                "book_appointment",
+                "check_appointment",
+                "reschedule",
+                "provide_details",
+            ),
             # Callers open with the real question far more often than with an intent.
             allowed_tools=("deep_reason",),
             transitions=(
                 Transition(when="book_appointment", to="collect_booking", reason="wants to book"),
                 Transition(when="check_appointment", to="lookup", reason="wants to check"),
                 Transition(when="reschedule", to="lookup", reason="wants to reschedule"),
+                # Nobody opens a call by stating a bare intent. "I need a cardiology
+                # appointment" carries the department with it and classifies as
+                # provide_details, which left the caller stuck at greet repeating
+                # themselves until max_turns escalated the call.
+                Transition(
+                    when="provide_details",
+                    to="collect_booking",
+                    reason="opened with booking details",
+                ),
             ),
             max_turns=3,
             on_max_turns="escalate",

@@ -31,7 +31,13 @@ class Provider:
     planner_model: str
     fast_model: str
     extra_body: dict[str, Any] = field(default_factory=dict)
-    """Provider-specific parameters. Sending Groq's reasoning_effort to NVIDIA errors."""
+    """Provider-specific parameters, forwarded as the request's ``extra_body``.
+
+    They must go through extra_body rather than as keyword arguments. The OpenAI SDK
+    validates its own signature, so a vendor parameter it does not know — NVIDIA's
+    chat_template_kwargs, for instance — raises TypeError before the request is ever
+    sent, taking the fallback provider down with it.
+    """
 
     timeout_scale: float = 1.0
     """Multiplier on every timeout budget.
@@ -77,7 +83,36 @@ NVIDIA = Provider(
     timeout_scale=float(os.getenv("NVIDIA_TIMEOUT_SCALE", "3.0")),
 )
 
-PROVIDERS = {p.name: p for p in (GROQ, NVIDIA)}
+SARVAM = Provider(
+    name="sarvam",
+    # /v2 hosts sarvam-105b and the open-weight models, but it is beta and returns 400
+    # on accounts without access. /v1 is the one that serves conversations today.
+    base_url="https://api.sarvam.ai/v1",
+    api_key_env="SARVAM_API_KEY",
+    # sarvam-105b-conversations is built for real-time dialogue rather than general
+    # reasoning, and it is trained on the 10 Indian languages this agent speaks. In
+    # Telugu it produces flow-appropriate replies where the gpt-oss models produce
+    # translated-sounding English. Verified live: streaming and tool calling both work.
+    # sarvam-m and sarvam-30b are deprecated; sarvam-105b needs the beta /v2 endpoint.
+    planner_model=os.getenv("SARVAM_PLANNER_MODEL", "sarvam-105b-conversations"),
+    fast_model=os.getenv("SARVAM_FAST_MODEL", "sarvam-105b-conversations"),
+    extra_body={
+        # Measured on a warm connection, median of 3: baseline 328 ms to first token,
+        # reasoning_effort=low 299 ms, wiki_grounding off 291 ms. Each is worth ~10%,
+        # which is small but free.
+        #
+        # wiki_grounding is off for a second reason: this agent answers from its flow
+        # and its tools, never from an encyclopedia, and grounding it against one only
+        # widens the surface for inventing facts the hospital never said.
+        "reasoning_effort": os.getenv("SARVAM_REASONING_EFFORT", "low"),
+        "wiki_grounding": False,
+    },
+    # Measured 1.1-2.3 s per call against Groq's 0.3-0.6 s. The budgets are set for Groq,
+    # so without headroom every turn times out and escalates.
+    timeout_scale=float(os.getenv("SARVAM_TIMEOUT_SCALE", "2.5")),
+)
+
+PROVIDERS = {p.name: p for p in (GROQ, NVIDIA, SARVAM)}
 
 
 def resolve(name: str | None = None) -> Provider:
@@ -91,11 +126,32 @@ def resolve(name: str | None = None) -> Provider:
             raise RuntimeError(f"{provider.api_key_env} is not set for provider {wanted!r}")
         return provider
 
-    for provider in (GROQ, NVIDIA):
+    for provider in (GROQ, NVIDIA, SARVAM):
         if provider.configured:
             return provider
 
     raise RuntimeError("No LLM provider configured. Set GROQ_API_KEY or NVIDIA_API_KEY.")
+
+
+def resolve_fast(primary: Provider) -> Provider:
+    """Provider for intent classification, which can differ from the planner's.
+
+    Worth splitting because the two roles are not alike. The planner's words are spoken
+    to the caller, so language quality decides whether the agent sounds native. Intent
+    classification returns a JSON label nobody ever hears, so it should be whatever is
+    cheapest and fastest.
+
+    That matters here beyond latency: Sarvam bills LLM calls against the same credit
+    balance as speech, so running classification there spends the budget twice per turn
+    on the half of it the caller cannot hear.
+    """
+    wanted = os.getenv("FAST_LLM_PROVIDER", "").strip().lower()
+    if not wanted:
+        return primary
+    if wanted not in PROVIDERS:
+        raise ValueError(f"Unknown FAST_LLM_PROVIDER {wanted!r}; choose from {sorted(PROVIDERS)}")
+    chosen = PROVIDERS[wanted]
+    return chosen if chosen.configured else primary
 
 
 def resolve_fallback(primary: Provider) -> Provider | None:

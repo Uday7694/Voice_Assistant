@@ -16,7 +16,12 @@ import time
 from typing import AsyncIterator
 
 from . import guardrails, intent as intent_mod, planner
-from .config import DEEP_REASON_ENABLED, MAX_CONSECUTIVE_NO_MATCH, MAX_TURNS_PER_SESSION
+from .config import (
+    DEEP_REASON_ENABLED,
+    LOCK_LANGUAGE,
+    MAX_CONSECUTIVE_NO_MATCH,
+    MAX_TURNS_PER_SESSION,
+)
 from .flow import Agent, next_node, validate
 from .llm import LLMClient
 from .memory import InMemorySessionStore, SessionStore
@@ -110,8 +115,19 @@ class Brain:
         # it. Set before the planner runs, since that is what invokes the tool.
         current_session.set(session_id)
 
+        # Before anything reads the text: invisible characters change how the classifier
+        # answers, and they arrive from real keyboards.
+        user_text = guardrails.normalise_input(user_text)
+
         stage_ms: dict[str, float] = {}
         started = time.perf_counter()
+
+        # The classifier needs the conversation *before* this utterance. Appending it
+        # first puts it in the prompt twice — once under "Recent conversation" and again
+        # as "User just said" — and the model reads the repetition as something it has
+        # failed to parse. Measured: the same Telugu sentence classifies as
+        # book_appointment against clean history and unknown against duplicated history.
+        history_before = session
         session = session.with_turn(Role.USER, user_text)
 
         # 0. Harvest any subagent answer that landed while the caller was talking. It
@@ -127,7 +143,7 @@ class Brain:
 
         # 2. Intent + slot extraction on the fast model.
         mark = time.perf_counter()
-        detected = await intent_mod.classify(self.llm, self.agent, session, user_text)
+        detected = await intent_mod.classify(self.llm, self.agent, history_before, user_text)
         stage_ms["intent"] = (time.perf_counter() - mark) * 1000
         yield IntentEvent(intent=detected)
 
@@ -222,6 +238,14 @@ class Brain:
         default = self.agent.languages[0]
         if not session.language:
             return session.model_copy(update={"language": default})
+
+        # Once the call has a language, keep it. A single English word from a Hindi
+        # caller would otherwise flip the whole conversation, and because the agent
+        # then answers in English the caller follows it there and it never flips back.
+        # Per-session metadata wins over the global default either way.
+        locked = session.metadata.get("language_locked", LOCK_LANGUAGE)
+        if locked:
+            return session
 
         switching = (
             detected.language

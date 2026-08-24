@@ -39,7 +39,16 @@ Rules:
   "bone doctor" -> "orthopaedics").
 - Normalise dates and times to plain readable text (e.g. "tomorrow 4 pm").
 - The user may mix English with an Indian language. Classify on meaning, not language.
-- Speech input is imperfect. Tolerate transcription noise and partial words."""
+- Report the language the caller is SPEAKING, not the script they typed it in. Indian
+  callers routinely write their own language in Latin letters: "mera naam amit hai" and
+  "aray madam appointment book kr do" are Hindi (hi-IN), not English, even though every
+  character is ASCII. Report English only when the words themselves are English.
+- Speech input is imperfect. Tolerate transcription noise and partial words.
+- The current step describes what the ASSISTANT is doing, not what the caller is
+  allowed to say. A caller can ask for anything at any point. Classify the utterance on
+  its own meaning and never answer "unknown" merely because it does not fit the step.
+- Reserve "unknown" for utterances you genuinely cannot interpret: silence, noise, or
+  something unrelated to the assistant's purpose."""
 
 
 def _prompt_for(node: Node, agent: Agent, session: Session, text: str) -> list[dict[str, str]]:

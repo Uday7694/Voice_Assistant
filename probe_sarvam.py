@@ -10,10 +10,14 @@ comes out. If the transcript resembles the input line, both directions work.
 from __future__ import annotations
 
 import asyncio
-import io
 import sys
 import time
-import wave
+
+# The Windows console defaults to cp1252, which cannot encode Devanagari, Tamil or
+# Telugu — printing a test line crashes before a single API call is made.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from dotenv import load_dotenv
 
@@ -28,16 +32,6 @@ LINES = {
     "te-IN": "మీ అపాయింట్‌మెంట్ రేపు ఉదయం పది గంటలకు నిర్ధారించబడింది.",
     "kn-IN": "ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ನಾಳೆ ಬೆಳಿಗ್ಗೆ ಹತ್ತು ಗಂಟೆಗೆ ದೃಢಪಡಿಸಲಾಗಿದೆ."
 }
-
-
-def to_wav(pcm: bytes, sample_rate: int) -> bytes:
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(sample_rate)
-        w.writeframes(pcm)
-    return buf.getvalue()
 
 
 async def synthesise(language: str, text: str) -> bytes:
@@ -67,7 +61,7 @@ async def transcribe(language: str, pcm: bytes) -> None:
     async with Ear(language=language, sample_rate=WEB_SAMPLE_RATE) as ear:
         async def push() -> None:
             for offset in range(0, len(pcm), frame_bytes):
-                await ear.feed(to_wav(pcm[offset : offset + frame_bytes], WEB_SAMPLE_RATE))
+                await ear.feed(pcm[offset : offset + frame_bytes])  # Ear wraps it
                 await asyncio.sleep(0.01)  # faster than real time, still ordered
             await ear.flush()
 

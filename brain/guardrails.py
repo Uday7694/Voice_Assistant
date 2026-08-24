@@ -35,6 +35,23 @@ _MEDICAL_ADVICE = re.compile(
 )
 
 
+# Zero-width joiners/non-joiners, the BOM, and bidi marks. They are invisible, they are
+# common in typed Indic text, and they wreck intent classification: the same Telugu
+# sentence classifies as book_appointment without them and as unknown with them. Sarvam
+# STT does not emit them, so leaving them in makes the bug look intermittent — typed
+# input fails, spoken input works, and nothing in the logs shows a difference.
+#
+# ZWNJ does carry rendering meaning in Indic scripts, suppressing conjunct forms. That
+# is a display concern, and stripping it here matches what the speech path produces
+# anyway, so the two input routes agree.
+_ZERO_WIDTH = re.compile(r"[​-‏⁠﻿­]")
+
+
+def normalise_input(text: str) -> str:
+    """Strip invisible characters before anything reasons about the text."""
+    return _ZERO_WIDTH.sub("", text)
+
+
 @dataclass(frozen=True)
 class InboundVerdict:
     allowed: bool = True

@@ -89,6 +89,8 @@ SCRIPT = [
 
 async def main() -> int:
     brain = Brain(HOSPITAL_AGENT)
+    # Open the LLM connections before the first turn, not during it.
+    await brain.llm.warm()
     session = brain.start(channel="sim")
     sink = PrintingSink()
 

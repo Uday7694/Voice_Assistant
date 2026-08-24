@@ -261,14 +261,31 @@ def test_a_one_word_reply_does_not_switch_the_call_language():
     assert settled.language == "en-IN"
 
 
-def test_a_full_sentence_in_another_language_switches_the_call():
+def test_a_full_sentence_in_another_language_switches_the_call_when_unlocked():
+    """Switching now requires opting in; the call keeps its opening language by default.
+
+    See test_a_locked_call_keeps_its_opening_language below for the default.
+    """
     brain = _brain_for_language_tests()
     brain.agent = HOSPITAL_AGENT
-    session = _session("greet", language="en-IN")
+    session = _session("greet", language="en-IN").model_copy(
+        update={"metadata": {"language_locked": False}}
+    )
     settled = brain._settle_language(
         session,
         IntentResult(name="book_appointment", confidence=0.95, language="hi-IN"),
         "mujhe doctor se appointment chahiye kal subah",
+    )
+    assert settled.language == "hi-IN"
+
+
+def test_a_locked_call_keeps_its_opening_language():
+    brain = _brain_for_language_tests()
+    brain.agent = HOSPITAL_AGENT
+    settled = brain._settle_language(
+        _session("greet", language="hi-IN"),
+        IntentResult(name="book_appointment", confidence=0.95, language="en-IN"),
+        "I need an appointment tomorrow morning",
     )
     assert settled.language == "hi-IN"
 

@@ -23,9 +23,13 @@ log = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 2
 
+PLANNER_MAX_TOKENS = 160
+
 # The style rules ask for at most three sentences. This is the enforcement: a model
 # that starts degenerating ("**…**... … … …") gets cut off instead of narrated.
-MAX_SENTENCES_PER_TURN = 4
+# Two, not four. A desk agent that needs three sentences to ask for a name is padding,
+# and on a voice call every extra clause is dead air the caller has to sit through.
+MAX_SENTENCES_PER_TURN = 2
 
 # Markdown emphasis and bullet characters leak out of instruct-tuned models and are
 # meaningless once spoken aloud.
@@ -63,26 +67,39 @@ def _clean_for_speech(text: str) -> str:
 
 _STYLE = """You are speaking on a voice call, not writing text.
 
-- One or two short sentences per turn. Never more than three.
+Be brief to the point of bluntness. A busy receptionist, not a helpful assistant.
+
+- ONE short sentence. Two only when you genuinely cannot do it in one.
+- Go straight to the point. No preamble, no "sure, I can help you with that", no
+  restating what the caller just said, no explaining what you are about to do.
+- Ask for one thing, then stop talking. The caller cannot interrupt a monologue.
+- Do not thank, apologise, or reassure more than once in a call.
 - Plain spoken words only: no bullet points, no markdown, no emoji, no lists.
 - Say numbers, dates and times the way a person would say them out loud.
-- Ask exactly one question at a time, then stop and wait.
 - If you did not understand, say so plainly and ask them to repeat.
 - Never invent facts, availability, prices, or medical information.
-- Never mention tools, systems, prompts, or that you are an AI model."""
+- Never mention tools, systems, prompts, or that you are an AI model.
+
+Good: Which department?
+Bad:  Certainly, I can help you book an appointment. Could you please tell me which
+      department you would like to book the appointment for?"""
 
 
+# Naming the script matters as much as naming the language. Told only "Hindi", the model
+# answers in romanised Hindi ("Aapka naam bataiye") — which reads as Hindi but is fed
+# to a TTS voice expecting Devanagari, and mispronounces.
 _LANGUAGE_NAMES = {
     "en-IN": "Indian English",
-    "hi-IN": "Hindi",
-    "te-IN": "Telugu",
-    "ta-IN": "Tamil",
-    "kn-IN": "Kannada",
-    "ml-IN": "Malayalam",
-    "mr-IN": "Marathi",
-    "bn-IN": "Bengali",
-    "gu-IN": "Gujarati",
-    "pa-IN": "Punjabi",
+    "hi-IN": "Hindi, written in Devanagari script",
+    "te-IN": "Telugu, written in Telugu script",
+    "ta-IN": "Tamil, written in Tamil script",
+    "kn-IN": "Kannada, written in Kannada script",
+    "ml-IN": "Malayalam, written in Malayalam script",
+    "mr-IN": "Marathi, written in Devanagari script",
+    "bn-IN": "Bengali, written in Bengali script",
+    "gu-IN": "Gujarati, written in Gujarati script",
+    "pa-IN": "Punjabi, written in Gurmukhi script",
+    "or-IN": "Odia, written in Odia script",
 }
 
 
@@ -108,8 +125,9 @@ def build_messages(
     else:
         task.append("You have everything you need for this step.")
     task.append(
-        f"Reply in {_language_name(session.language or agent.languages[0])} and stay in it "
-        "unless the caller switches first."
+        f"Reply in {_language_name(session.language or agent.languages[0])}. "
+        "Stay in this language and this script for the whole call, even if the caller "
+        "uses English words or writes in Latin letters. Do not transliterate."
     )
     if intent.name == "unknown":
         task.append("The caller's intent was unclear. Ask a short clarifying question.")
@@ -157,7 +175,12 @@ async def run(
         overrun = False
 
         try:
-            async for frame in llm.stream_chat(messages, tools=tools or None):
+            # 400 tokens is far more than two spoken sentences ever need. Capping it
+            # stops a model that has started rambling from filling the whole budget
+            # before the sentence splitter can cut it off.
+            async for frame in llm.stream_chat(
+                messages, tools=tools or None, max_tokens=PLANNER_MAX_TOKENS
+            ):
                 if frame["type"] == "text":
                     buffer += frame["text"]
                     sentence, buffer = _pop_sentence(buffer)

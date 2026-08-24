@@ -59,6 +59,8 @@ def render(event, *, quiet: bool) -> None:
 
 async def main(quiet: bool) -> None:
     brain = Brain(HOSPITAL_AGENT)
+    # Open the LLM connections before the first turn, not during it.
+    await brain.llm.warm()
     session = brain.start(channel="cli")
     console.print(f"[bold]{HOSPITAL_AGENT.name}[/] session {session.session_id} — Ctrl-C to quit\n")
 
