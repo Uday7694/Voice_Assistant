@@ -36,6 +36,10 @@ GLOBAL_INTENTS = (
     "end_conversation",
     "repeat_that",
     "out_of_scope",
+    # A caller swearing is not a caller asking for a human. Without a label of its own,
+    # the classifier reached for escalate_to_human and every insult transferred the call
+    # instantly — which is both wrong and an easy way to skip the queue.
+    "abusive",
 )
 
 
@@ -70,8 +74,15 @@ class Session(BaseModel):
 
     turns_in_node: int = 0
     no_match_streak: int = 0
+    abuse_streak: int = 0
+    """Consecutive abusive turns. Reset by one ordinary turn: people cool down."""
     ended: bool = False
     escalated: bool = False
+    flagged: bool = False
+    """Marked for human review. Separate from `escalated`: a call can be handed to a
+    person for ordinary reasons, and those should not appear in an abuse report."""
+
+    flag_reason: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def with_turn(self, role: Role, text: str) -> "Session":

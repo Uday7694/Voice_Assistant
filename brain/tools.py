@@ -99,28 +99,76 @@ class ToolRegistry:
 _DEMO_SLOTS = {
     "cardiology": ["tomorrow 10:00 am", "tomorrow 3:30 pm", "Friday 11:00 am"],
     "orthopaedics": ["today 6:00 pm", "tomorrow 9:15 am"],
+    "ent": ["today 4:00 pm", "tomorrow 11:30 am"],
     "general medicine": ["today 5:00 pm", "tomorrow 8:30 am", "tomorrow 12:00 pm"],
 }
 
+# What callers actually say, mapped to what the hospital calls it. Callers describe a
+# body part or a symptom, not a department, and speech recognition mangles both.
+_DEPARTMENT_ALIASES = {
+    "heart": "cardiology", "cardiac": "cardiology", "cardio": "cardiology",
+    "bone": "orthopaedics", "bones": "orthopaedics", "joint": "orthopaedics",
+    "ortho": "orthopaedics", "orthopedics": "orthopaedics", "knee": "orthopaedics",
+    "sinus": "ent", "synus": "ent", "sinuses": "ent", "ear": "ent", "nose": "ent",
+    "throat": "ent", "e n t": "ent", "ent": "ent",
+    "general": "general medicine", "physician": "general medicine",
+    "fever": "general medicine", "gp": "general medicine",
+}
+
+
+def resolve_department(name: str) -> str | None:
+    """Map what the caller said onto a real department, or None.
+
+    None is the important half. The old behaviour handed back general medicine's slots
+    under whatever name the caller used, so "synus" produced three real-looking times
+    for a department that does not exist — and the model, having been given a
+    department it did not recognise, renamed it "surgery" on the way out. Inventing
+    availability is worse than admitting the department is unknown.
+    """
+    key = " ".join(name.strip().lower().split())
+    if not key:
+        return None
+    if key in _DEMO_SLOTS:
+        return key
+    return _DEPARTMENT_ALIASES.get(key)
+
 
 async def _check_availability(department: str = "", preferred_time: str = "") -> dict[str, Any]:
-    key = department.strip().lower()
-    slots = _DEMO_SLOTS.get(key, _DEMO_SLOTS["general medicine"])
-    return {"department": department or "general medicine", "available_slots": slots}
+    resolved = resolve_department(department)
+    if resolved is None:
+        return {
+            "error": "unknown_department",
+            "requested": department,
+            "known_departments": sorted(_DEMO_SLOTS),
+        }
+    return {"department": resolved, "available_slots": _DEMO_SLOTS[resolved]}
 
 
 async def _book_appointment(
     patient_name: str = "", department: str = "", slot: str = "", phone: str = ""
 ) -> dict[str, Any]:
-    if not (patient_name and slot):
-        return {"error": "patient_name and slot are required"}
+    if not (patient_name and slot and phone):
+        return {"error": "patient_name, slot and phone are required"}
+
+    # Validate here too. Availability and booking are separate calls, and a caller who
+    # changed department in between would otherwise be booked into one that does not
+    # exist.
+    resolved = resolve_department(department)
+    if resolved is None:
+        return {
+            "error": "unknown_department",
+            "requested": department,
+            "known_departments": sorted(_DEMO_SLOTS),
+        }
+
     reference = f"APT{abs(hash((patient_name, slot))) % 100000:05d}"
     return {
         "booked": True,
         "reference": reference,
         "patient_name": patient_name,
-        "department": department or "general medicine",
+        "department": resolved,
         "slot": slot,
+        "phone": phone,
     }
 
 
@@ -210,7 +258,11 @@ def build_default_registry(subagent: DeepSubagent | None = None) -> ToolRegistry
     registry.register(
         Tool(
             name="check_availability",
-            description="List open appointment slots for a hospital department.",
+            description=(
+                "List open appointment slots for a hospital department. Returns "
+                "unknown_department with the real list if the department does not "
+                "exist — read that list to the caller instead of guessing."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -236,7 +288,10 @@ def build_default_registry(subagent: DeepSubagent | None = None) -> ToolRegistry
                     "slot": {"type": "string", "description": "Exact slot the caller agreed to"},
                     "phone": {"type": "string"},
                 },
-                "required": ["patient_name", "slot"],
+                # phone is required, not optional: close/ tells the caller an SMS is on
+                # its way, and booking without a number makes that a promise the system
+                # cannot keep.
+                "required": ["patient_name", "slot", "phone"],
             },
             handler=_book_appointment,
             fallback_line="I wasn't able to confirm that booking.",

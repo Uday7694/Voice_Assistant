@@ -44,9 +44,10 @@ from brain.orchestrator import Brain  # noqa: E402
 from brain.speech import WEB_SAMPLE_RATE, Mouth, SarvamError  # noqa: E402
 
 OPENERS = {
-    "te-IN": "నమస్కారం! నేను మీరా. మీకు ఎలా సహాయం చేయగలను?",
-    "hi-IN": "नमस्ते! मैं मीरा बोल रही हूँ। मैं आपकी क्या मदद कर सकती हूँ?",
-    "en-IN": "Hello! This is Meera. How can I help you today?",
+    # Spoken on every call, so it is the single most repeated cost in the system.
+    "te-IN": "నమస్కారం, మీరా. ఎలా సహాయపడను?",
+    "hi-IN": "नमस्ते, मीरा बोल रही हूँ। कैसे मदद करूँ?",
+    "en-IN": "Hello, Meera here. How can I help?",
 }
 
 
@@ -63,12 +64,22 @@ class Speaker:
         self.language = language
         self.silent = silent
         self.calls = 0
+        # Bulbul bills per character, so characters are the number that matters, not
+        # requests. Tracked here so the cost of a change is visible while making it.
+        self.chars = 0
         self._mouth = None if silent else Mouth(
             language=language, codec="linear16", sample_rate=WEB_SAMPLE_RATE
         )
 
     async def say(self, text: str) -> None:
-        if self.silent or not text.strip():
+        if not text.strip():
+            return
+
+        # Count even when silent. Bulbul bills per character, so the cost of a prompt
+        # change has to be measurable without paying for it — otherwise every attempt
+        # to make the agent terser costs credits to evaluate.
+        self.chars += len(text)
+        if self.silent:
             return
 
         pcm = bytearray()
@@ -160,7 +171,17 @@ async def main() -> int:
         if finished:
             break
 
-    print(f"\n  call ended · {speaker.calls} TTS call(s) spent\n")
+    # Bulbul bills 3 credits per 1000 characters, so characters are the unit that
+    # matters here, not turns and not requests.
+    credits = speaker.chars * 3 / 1000
+    label = "would cost" if silent else "spoken"
+    print()
+    print(
+        "  call ended: "
+        f"{speaker.chars} characters {label} "
+        f"(~{credits:.2f} credits, {speaker.calls} TTS calls)"
+    )
+    print()
     return 0
 
 

@@ -15,9 +15,10 @@ import logging
 import time
 from typing import AsyncIterator
 
-from . import guardrails, intent as intent_mod, planner
+from . import guardrails, intent as intent_mod, phrases, planner
 from .config import (
     DEEP_REASON_ENABLED,
+    MAX_ABUSIVE_TURNS,
     LOCK_LANGUAGE,
     MAX_CONSECUTIVE_NO_MATCH,
     MAX_TURNS_PER_SESSION,
@@ -40,7 +41,7 @@ from .models import (
     TransitionEvent,
 )
 from .subagent import DeepSubagent, current_session
-from .tools import ToolRegistry, build_default_registry
+from .tools import ToolOutcome, ToolRegistry, build_default_registry
 
 log = logging.getLogger(__name__)
 
@@ -149,7 +150,22 @@ class Brain:
 
         session = session.with_slots(detected.slots)
         session = self._track_no_match(session, detected)
+        session = self._track_abuse(session, detected)
         session = self._settle_language(session, detected, user_text)
+
+        # An abusive caller is answered politely, not transferred. Only a sustained
+        # pattern reaches a person, and that call is flagged so it can be reviewed
+        # later rather than disappearing into the ordinary escalation queue.
+        if session.abuse_streak > MAX_ABUSIVE_TURNS:
+            reason = f"{session.abuse_streak} abusive turns"
+            session = session.model_copy(
+                update={"flagged": True, "flag_reason": reason}
+            )
+            self.store.put(session)
+            log.warning("Session %s flagged: %s", session.session_id, reason)
+            async for event in self._escalate(session, reason):
+                yield event
+            return
 
         # 3. Flow control — deterministic, no model involved.
         decision = next_node(self.agent, session, detected)
@@ -191,6 +207,7 @@ class Brain:
                 yield SayEvent(text=frame["text"])
             elif frame["type"] == "tool":
                 outcome = frame["outcome"]
+                session = self._adopt_canonical_slots(session, outcome)
                 yield ToolEvent(
                     name=outcome.name, result=outcome.result, ok=outcome.ok, ms=outcome.ms
                 )
@@ -259,6 +276,18 @@ class Brain:
             return session.model_copy(update={"language": detected.language})
         return session
 
+    def _track_abuse(self, session: Session, detected: IntentResult) -> Session:
+        """Count consecutive abusive turns, resetting on any ordinary one.
+
+        Resetting matters. People swear out of frustration and then carry on normally;
+        counting cumulatively would hand the call to a person twenty turns after the
+        caller had already apologised.
+        """
+        streak = session.abuse_streak + 1 if detected.name == "abusive" else 0
+        if streak:
+            log.info("Abusive turn %d in session %s", streak, session.session_id)
+        return session.model_copy(update={"abuse_streak": streak})
+
     def _track_no_match(self, session: Session, detected: IntentResult) -> Session:
         missed = detected.name == "unknown" or not detected.is_confident
         streak = session.no_match_streak + 1 if missed else 0
@@ -278,6 +307,36 @@ class Brain:
     # agent's own stage directions. A plain fact degrades safely: spoken as-is it is
     # still a true, coherent sentence.
     EXPERT_FAILED = "The information could not be retrieved."
+
+    # Slot values a tool is authoritative about. When a tool normalises one of these,
+    # its answer replaces whatever the caller's phrasing put there.
+    CANONICAL_SLOTS = ("department",)
+
+    def _adopt_canonical_slots(self, session: Session, outcome: ToolOutcome) -> Session:
+        """Replace caller phrasing with the value the backend actually recognised.
+
+        The caller says "synus"; the tool resolves that to "ent" and returns real ENT
+        slots. Without writing it back, the session keeps "synus" and every later prompt
+        carries it as an established fact — so the agent reads out ENT times under a
+        department name the hospital does not have, and a model asked to say something
+        sensible about "synus" invents "surgery".
+
+        Only successful results are trusted: an unknown_department error carries the
+        caller's rejected wording, not a correction.
+        """
+        if not outcome.ok:
+            return session
+
+        corrections = {
+            key: str(outcome.result[key])
+            for key in self.CANONICAL_SLOTS
+            if outcome.result.get(key) and str(outcome.result[key]) != session.slots.get(key)
+        }
+        if not corrections:
+            return session
+
+        log.info("Tool %s corrected slots: %s", outcome.name, corrections)
+        return session.with_slots(corrections)
 
     def _absorb_subagent(self, session: Session) -> Session:
         """Fold finished subagent results into the session for exactly one turn.
@@ -338,7 +397,10 @@ class Brain:
         self, session: Session, reason: str, spoken: str = ""
     ) -> AsyncIterator[Event]:
         self._release_subagent(session)
-        line = spoken or "Let me put you through to a colleague who can help with this."
+        # In the caller's language. An English sentence at the end of a Hindi call is
+        # the most jarring moment in the conversation, and it lands exactly when the
+        # caller is already unhappy.
+        line = spoken or phrases.handoff(session.language or self.agent.languages[0])
         yield SayEvent(text=line, is_final=True)
         yield EscalateEvent(reason=reason)
         self.store.put(

@@ -48,7 +48,11 @@ Rules:
   allowed to say. A caller can ask for anything at any point. Classify the utterance on
   its own meaning and never answer "unknown" merely because it does not fit the step.
 - Reserve "unknown" for utterances you genuinely cannot interpret: silence, noise, or
-  something unrelated to the assistant's purpose."""
+  something unrelated to the assistant's purpose.
+- Use "abusive" for insults, swearing or threats aimed at the assistant or anyone else,
+  in any language or script. Do NOT use "escalate_to_human" for these: that intent means
+  the caller explicitly asked to speak to a person. Frustration on its own ("this is
+  useless", "you are not helping") is not abuse."""
 
 
 def _prompt_for(node: Node, agent: Agent, session: Session, text: str) -> list[dict[str, str]]:

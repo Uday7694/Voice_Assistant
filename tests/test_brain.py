@@ -228,9 +228,24 @@ def test_booking_is_withheld_until_a_slot_has_been_chosen():
     assert "book_appointment" not in _tool_names("offer_slots", slots)
 
 
-def test_booking_is_offered_at_the_closing_step_once_a_slot_exists():
-    slots = {"patient_name": "Asha", "department": "cardiology", "slot": "tomorrow 10:00 am"}
+def test_booking_is_offered_at_the_closing_step_once_every_detail_exists():
+    slots = {
+        "patient_name": "Asha",
+        "department": "cardiology",
+        "slot": "tomorrow 10:00 am",
+        "phone": "9900000000",
+    }
     assert "book_appointment" in _tool_names("close", slots)
+
+
+def test_booking_is_withheld_until_a_phone_number_is_known():
+    """The closing line promises a confirmation SMS.
+
+    Booking without a number makes that a promise the system cannot keep, so the tool
+    stays hidden rather than trusting the model not to call it.
+    """
+    slots = {"patient_name": "Asha", "department": "cardiology", "slot": "tomorrow 10:00 am"}
+    assert "book_appointment" not in _tool_names("close", slots)
 
 
 # --- language stickiness --------------------------------------------------

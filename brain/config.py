@@ -11,9 +11,9 @@ load_dotenv()
 # Model selection and provider endpoints live in brain/providers.py.
 
 # Budgets in seconds. The planner budget is what protects the turn latency target.
-PLANNER_TIMEOUT = 8.0
-FAST_TIMEOUT = 3.0
-TOOL_TIMEOUT = 1.5
+PLANNER_TIMEOUT = float(os.getenv("PLANNER_TIMEOUT", "8.0"))
+FAST_TIMEOUT = float(os.getenv("FAST_TIMEOUT", "3.0"))
+TOOL_TIMEOUT = float(os.getenv("TOOL_TIMEOUT", "1.5"))
 
 # The deep-reasoning subagent is opt-in and off by default.
 #
@@ -42,7 +42,18 @@ DEEP_REASON_ENABLED = os.getenv("DEEP_REASON_ENABLED", "").strip().lower() in {
 # Set LANGUAGE_FOLLOWS_CALLER=1 for the old behaviour, per deployment.
 LOCK_LANGUAGE = os.getenv("LANGUAGE_FOLLOWS_CALLER", "").strip() not in {"1", "true", "yes", "on"}
 
-# Conversation limits enforced in code, never in the prompt.
-MAX_TURNS_PER_SESSION = 40
-MAX_CONSECUTIVE_NO_MATCH = 2
-MAX_HISTORY_TURNS = 12
+# Conversation limits, enforced in code and never in the prompt. Every one is
+# overridable per deployment: a hospital desk and an outbound campaign do not want the
+# same patience, and changing that should not mean editing source.
+MAX_TURNS_PER_SESSION = int(os.getenv("MAX_TURNS_PER_SESSION", "40"))
+MAX_CONSECUTIVE_NO_MATCH = int(os.getenv("MAX_CONSECUTIVE_NO_MATCH", "2"))
+MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "12"))
+
+# Abusive turns answered politely before the call is flagged and handed to a person.
+#
+# Three, not one. People swear out of frustration and usually carry on normally once
+# asked to stop, and hanging up on a first outburst is worse service than absorbing it.
+# The count resets after any ordinary turn, so this measures a sustained pattern rather
+# than a bad moment. Every one of those turns still gets a polite answer — the agent's
+# tone does not harden as the count rises.
+MAX_ABUSIVE_TURNS = int(os.getenv("MAX_ABUSIVE_TURNS", "3"))

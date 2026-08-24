@@ -417,6 +417,10 @@ def test_disabled_builds_no_http_client(monkeypatch):
 
 
 def test_the_env_flag_enables_it(monkeypatch):
+    # Supply the key rather than relying on a local .env. Without this the test passes
+    # on a developer machine that happens to have NVIDIA credentials and fails on a
+    # clean clone, where deep_reason is correctly never registered.
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
     brain = _brain(monkeypatch, True)
     assert brain.subagent is not None
     assert brain.registry.get("deep_reason") is not None

@@ -268,3 +268,60 @@ def test_the_classifier_is_told_the_step_does_not_constrain_the_caller():
 
     assert "not what the caller is" in _SYSTEM
     assert "never answer" in _SYSTEM.lower()
+
+
+# --- phone collection ------------------------------------------------------
+
+
+def test_a_phone_number_is_collected_before_confirming():
+    """The closing line promises an SMS, so a number has to exist by then."""
+    node = HOSPITAL_AGENT.node("collect_phone")
+    assert node.required_slots == ("phone",)
+    assert any(t.to == "confirm" for t in node.transitions)
+
+
+def test_the_slot_step_leads_into_phone_collection():
+    node = HOSPITAL_AGENT.node("offer_slots")
+    assert any(t.when == "slots_filled" and t.to == "collect_phone" for t in node.transitions)
+
+
+def test_booking_cannot_be_called_without_a_phone_number():
+    from brain.tools import build_default_registry
+
+    tool = build_default_registry().get("book_appointment")
+    assert "phone" in tool.parameters["required"]
+
+
+@pytest.mark.asyncio
+async def test_the_booking_handler_refuses_without_a_phone_number():
+    """Structural, not a prompt instruction: the model cannot talk its way past it."""
+    from brain.tools import build_default_registry
+
+    registry = build_default_registry()
+    outcome = await registry.invoke(
+        "book_appointment", {"patient_name": "Amit", "slot": "tomorrow 10:00 am"}
+    )
+    assert "error" in outcome.result
+
+
+# --- character economy -----------------------------------------------------
+
+
+def test_identifiers_are_not_spelled_out_in_words():
+    """Bulbul bills per character; ten digits as words is the priciest line in a call."""
+    from brain.planner import _STYLE
+
+    lowered = _STYLE.lower()
+    assert "plain digits" in lowered
+    assert "leave the phone" in lowered
+
+
+def test_the_confirm_step_does_not_repeat_the_phone_number():
+    goal = HOSPITAL_AGENT.node("confirm").goal.lower()
+    assert "do not repeat the phone number" in goal
+
+
+def test_the_style_prompt_states_that_output_costs_money():
+    from brain.planner import _STYLE
+
+    assert "costs money to synthesise" in _STYLE

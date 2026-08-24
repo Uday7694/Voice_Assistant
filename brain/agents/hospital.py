@@ -79,10 +79,24 @@ HOSPITAL_AGENT = Agent(
             expected_intents=("choose_slot", "ask_other_times", "provide_details"),
             allowed_tools=("check_availability", "deep_reason"),
             transitions=(
-                Transition(when="slots_filled", to="confirm", reason="slot chosen"),
+                Transition(when="slots_filled", to="collect_phone", reason="slot chosen"),
                 Transition(when="ask_other_times", to="offer_slots", reason="wants other options"),
             ),
             max_turns=5,
+        ),
+        Node(
+            id="collect_phone",
+            goal=(
+                "Ask for a ten digit mobile number for the confirmation message. Nothing "
+                "else."
+            ),
+            required_slots=("phone",),
+            expected_intents=("provide_details", "change_slot"),
+            transitions=(
+                Transition(when="slots_filled", to="confirm", reason="number given"),
+                Transition(when="change_slot", to="offer_slots", reason="wants a different slot"),
+            ),
+            max_turns=3,
         ),
         Node(
             # No deep_reason here: this node exists to read details back and take a
@@ -90,8 +104,8 @@ HOSPITAL_AGENT = Agent(
             # one point in the call where they are ready to commit.
             id="confirm",
             goal=(
-                "Read back the name, department and slot, and ask the caller to confirm. Do "
-                "not book anything at this step — just get a clear yes or no."
+                "Read back only the name, department and slot, then ask for a yes or no. "
+                "Do not repeat the phone number. Do not book anything at this step."
             ),
             expected_intents=("confirm_yes", "confirm_no", "change_slot"),
             transitions=(

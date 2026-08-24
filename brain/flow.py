@@ -95,6 +95,9 @@ def next_node(agent: Agent, session: Session, intent: IntentResult) -> FlowDecis
 
     if intent.name == "end_conversation":
         return FlowDecision(node_id=current.id, changed=False, reason="user ended", force_end=True)
+    # "abusive" deliberately has no branch here. It is handled by the orchestrator,
+    # which answers the caller and keeps the conversation at the current node; routing
+    # it through the flow would end the call on the first insult.
     if intent.name == "escalate_to_human":
         return FlowDecision(
             node_id=current.id, changed=False, reason="user asked for a human", force_escalate=True
