@@ -16,7 +16,7 @@ import time
 from typing import AsyncIterator
 
 from . import guardrails, intent as intent_mod, planner
-from .config import MAX_CONSECUTIVE_NO_MATCH, MAX_TURNS_PER_SESSION
+from .config import DEEP_REASON_ENABLED, MAX_CONSECUTIVE_NO_MATCH, MAX_TURNS_PER_SESSION
 from .flow import Agent, next_node, validate
 from .llm import LLMClient
 from .memory import InMemorySessionStore, SessionStore
@@ -49,6 +49,7 @@ class Brain:
         registry: ToolRegistry | None = None,
         store: SessionStore | None = None,
         subagent: DeepSubagent | None = None,
+        deep_reason: bool | None = None,
     ) -> None:
         problems = validate(agent)
         if problems:
@@ -56,10 +57,28 @@ class Brain:
 
         self.agent = agent
         self.llm = llm or LLMClient()
-        # Deep-reasoning subagent on NVIDIA NIM, off the hot path; degrades to absent when
-        # NVIDIA_API_KEY is unset, in which case deep_reason is simply never offered.
-        self.subagent = subagent if subagent is not None else DeepSubagent()
+
+        # Deep reasoning is opt-in: explicit argument first, then DEEP_REASON_ENABLED.
+        # Passing a subagent counts as opting in, since constructing one is deliberate.
+        #
+        # Off is a real off. self.subagent stays None, so no HTTP client is built, no
+        # deep_reason tool is registered, and no prompt ever mentions it — the turn is
+        # exactly as fast as before this tier existed.
+        wants_deep = deep_reason if deep_reason is not None else DEEP_REASON_ENABLED
+        if subagent is not None:
+            self.subagent: DeepSubagent | None = subagent
+        elif wants_deep:
+            self.subagent = DeepSubagent()
+            if not self.subagent.configured:
+                log.warning(
+                    "Deep reasoning requested but NVIDIA_API_KEY is unset; "
+                    "staying on the fast path."
+                )
+        else:
+            self.subagent = None
+
         self.registry = registry or build_default_registry(self.subagent)
+        log.info("Deep reasoning %s", "enabled" if self.subagent else "disabled")
         self.store = store or InMemorySessionStore()
 
     # --- session lifecycle -------------------------------------------------
@@ -246,6 +265,8 @@ class Brain:
         was checking, so staying quiet strands them waiting for an answer that will
         never arrive; a short apology and a human is the honest outcome.
         """
+        if self.subagent is None:
+            return session
         results = self.subagent.collect(session.session_id)
         if not results:
             return session
@@ -283,6 +304,8 @@ class Brain:
         the job would sit in the pool forever holding a queue slot; enough abandoned
         calls and deep_reason is permanently busy for every future caller.
         """
+        if self.subagent is None:
+            return
         abandoned = self.subagent.discard_session(session.session_id)
         if abandoned:
             log.info("Abandoned %d subagent job(s) for ended session %s", abandoned, session.session_id)

@@ -326,3 +326,133 @@ async def test_ending_a_call_releases_its_queue_slot():
     brain._release_subagent(session)
     assert len(sub._jobs) == 0
     await sub.aclose()
+
+
+# --- node coverage ---------------------------------------------------------
+
+
+def _offered_at(node_id, subagent):
+    from brain.agents.hospital import HOSPITAL_AGENT
+    from brain.models import Session
+    from brain.planner import _available_tools
+
+    slots = {
+        "patient_name": "Asha",
+        "department": "cardiology",
+        "slot": "tomorrow 10:00 am",
+        "phone": "9900000000",
+    }
+    schemas = _available_tools(
+        build_default_registry(subagent),
+        HOSPITAL_AGENT,
+        HOSPITAL_AGENT.node(node_id),
+        Session(agent_name="h", node_id=node_id).with_slots(slots),
+    )
+    return {s["function"]["name"] for s in schemas}
+
+
+def test_deep_reason_is_offered_where_an_answer_can_still_land():
+    sub = FakeSubagent()
+    for node_id in ("greet", "collect_booking", "offer_slots", "lookup"):
+        assert "deep_reason" in _offered_at(node_id, sub), node_id
+
+
+def test_deep_reason_is_withheld_from_confirm_and_close():
+    """Both nodes end faster than the subagent answers.
+
+    ``confirm`` takes a yes or no and ``close`` is terminal at two turns, so a 6-25 s
+    job could only promise the caller an answer that arrives after the call.
+    """
+    sub = FakeSubagent()
+    for node_id in ("confirm", "close"):
+        assert "deep_reason" not in _offered_at(node_id, sub), node_id
+
+
+def test_nodes_still_offer_their_own_tools():
+    """Adding deep_reason must not displace the tool the node actually exists for."""
+    sub = FakeSubagent()
+    assert "check_availability" in _offered_at("offer_slots", sub)
+    assert "lookup_appointment" in _offered_at("lookup", sub)
+    assert "book_appointment" in _offered_at("close", sub)
+
+
+def test_flow_stays_valid_without_an_nvidia_key():
+    """greet lists only deep_reason; unconfigured it must degrade, not break."""
+    from brain.flow import validate
+    from brain.agents.hospital import HOSPITAL_AGENT
+
+    assert not validate(HOSPITAL_AGENT)
+    assert _offered_at("greet", DeepSubagent(api_key="")) == set()
+
+
+# --- opt-in ----------------------------------------------------------------
+
+
+class _StubLLM:
+    """Brain needs an LLM object; these tests never reach a model."""
+
+    provider = type("P", (), {"name": "stub", "planner_model": "m", "fast_model": "m"})()
+    fallback = None
+
+
+def _brain(monkeypatch, env_enabled, **kwargs):
+    from brain.agents.hospital import HOSPITAL_AGENT
+    from brain.orchestrator import Brain
+
+    monkeypatch.setattr("brain.orchestrator.DEEP_REASON_ENABLED", env_enabled)
+    return Brain(HOSPITAL_AGENT, llm=_StubLLM(), **kwargs)
+
+
+def test_deep_reasoning_is_off_by_default(monkeypatch):
+    """The fast path must stay the default: opting in is a deliberate act."""
+    brain = _brain(monkeypatch, False)
+    assert brain.subagent is None
+    assert brain.registry.get("deep_reason") is None
+
+
+def test_disabled_builds_no_http_client(monkeypatch):
+    """Off means nothing is constructed, not merely that the tool is hidden."""
+    brain = _brain(monkeypatch, False)
+    assert brain.subagent is None  # no client, no threads, no startup cost
+
+
+def test_the_env_flag_enables_it(monkeypatch):
+    brain = _brain(monkeypatch, True)
+    assert brain.subagent is not None
+    assert brain.registry.get("deep_reason") is not None
+
+
+def test_an_explicit_argument_beats_the_env_flag(monkeypatch):
+    assert _brain(monkeypatch, False, deep_reason=True).subagent is not None
+    assert _brain(monkeypatch, True, deep_reason=False).subagent is None
+
+
+def test_passing_a_subagent_counts_as_opting_in(monkeypatch):
+    sub = FakeSubagent()
+    brain = _brain(monkeypatch, False, subagent=sub)
+    assert brain.subagent is sub
+    assert brain.registry.get("deep_reason") is not None
+
+
+def test_turn_helpers_are_safe_when_disabled(monkeypatch):
+    """Every subagent touchpoint must no-op rather than raise on the fast path."""
+    brain = _brain(monkeypatch, False)
+    session = _session()
+    assert brain._absorb_subagent(session) is session
+    brain._release_subagent(session)  # must not raise
+
+
+def test_no_node_offers_the_tool_when_disabled(monkeypatch):
+    from brain.agents.hospital import HOSPITAL_AGENT
+    from brain.models import Session
+    from brain.planner import _available_tools
+
+    brain = _brain(monkeypatch, False)
+    for node in HOSPITAL_AGENT.nodes:
+        schemas = _available_tools(
+            brain.registry,
+            HOSPITAL_AGENT,
+            node,
+            Session(agent_name="h", node_id=node.id),
+        )
+        assert "deep_reason" not in {s["function"]["name"] for s in schemas}, node.id

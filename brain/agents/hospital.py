@@ -29,6 +29,8 @@ HOSPITAL_AGENT = Agent(
             id="greet",
             goal="Greet the caller in one short line and ask how you can help.",
             expected_intents=("book_appointment", "check_appointment", "reschedule"),
+            # Callers open with the real question far more often than with an intent.
+            allowed_tools=("deep_reason",),
             transitions=(
                 Transition(when="book_appointment", to="collect_booking", reason="wants to book"),
                 Transition(when="check_appointment", to="lookup", reason="wants to check"),
@@ -59,7 +61,7 @@ HOSPITAL_AGENT = Agent(
             ),
             required_slots=("slot",),
             expected_intents=("choose_slot", "ask_other_times", "provide_details"),
-            allowed_tools=("check_availability",),
+            allowed_tools=("check_availability", "deep_reason"),
             transitions=(
                 Transition(when="slots_filled", to="confirm", reason="slot chosen"),
                 Transition(when="ask_other_times", to="offer_slots", reason="wants other options"),
@@ -67,6 +69,9 @@ HOSPITAL_AGENT = Agent(
             max_turns=5,
         ),
         Node(
+            # No deep_reason here: this node exists to read details back and take a
+            # yes or no. A 6-25 s detour mid-confirmation strands the caller at the
+            # one point in the call where they are ready to commit.
             id="confirm",
             goal=(
                 "Read back the name, department and slot, and ask the caller to confirm. Do "
@@ -88,7 +93,7 @@ HOSPITAL_AGENT = Agent(
             ),
             required_slots=("phone",),
             expected_intents=("provide_details", "reschedule", "cancel"),
-            allowed_tools=("lookup_appointment",),
+            allowed_tools=("lookup_appointment", "deep_reason"),
             transitions=(
                 Transition(when="reschedule", to="offer_slots", reason="wants a new time"),
                 Transition(when="slots_filled", to="close", reason="details given"),
@@ -96,6 +101,9 @@ HOSPITAL_AGENT = Agent(
             max_turns=5,
         ),
         Node(
+            # No deep_reason here either. Terminal, max_turns=2 — an answer that takes
+            # 6-25 s cannot arrive before the call is over, so offering the tool would
+            # only promise the caller something that never comes.
             id="close",
             goal=(
                 "Call book_appointment now, then read back the exact reference code it "
