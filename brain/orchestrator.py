@@ -12,18 +12,21 @@ Order of operations per turn:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import AsyncIterator
 
-from . import guardrails, intent as intent_mod, phrases, planner
+from . import guardrails, intent as intent_mod, planner, slots as slot_mod, transcripts
 from .config import (
     DEEP_REASON_ENABLED,
-    MAX_ABUSIVE_TURNS,
     LOCK_LANGUAGE,
+    MAX_ABUSIVE_TURNS,
     MAX_CONSECUTIVE_NO_MATCH,
+    MAX_OFF_TOPIC_TURNS,
     MAX_TURNS_PER_SESSION,
 )
 from .flow import Agent, next_node, validate
+from .lines import LineBook
 from .llm import LLMClient
 from .memory import InMemorySessionStore, SessionStore
 from .models import (
@@ -44,6 +47,111 @@ from .subagent import DeepSubagent, current_session
 from .tools import ToolOutcome, ToolRegistry, build_default_registry
 
 log = logging.getLogger(__name__)
+
+
+# What the planner is told when it is about to ask the same thing again. The wording
+# escalates, because a caller who did not answer twice did not mishear twice — the
+# question itself is the problem, so the second attempt rephrases and the third offers
+# a way out. The agent never says "I already asked you": blaming the caller is how a
+# stuck call becomes an angry one.
+_REASK = {
+    2: (
+        "You already asked for {slot} last turn and did not get it. Ask again in "
+        "different words, shorter than before. Do not repeat your previous sentence."
+    ),
+    3: (
+        "You have asked for {slot} twice with no answer. Ask a third time in plainly "
+        "different words, and make it answerable in one word — give an example of what "
+        "you need if that helps. Do not mention that you already asked."
+    ),
+}
+
+_REASK_LAST = (
+    "You have asked for {slot} {count} times without an answer. Ask once more, very "
+    "simply, and offer to put them through to a colleague if it is easier. Do not "
+    "mention that you already asked."
+)
+
+
+# Written as a brief, not as a sentence to translate. The old version handed the model
+# the purpose line verbatim — "booking, checking and rescheduling doctor appointments" —
+# and a model given a three-verb list translates the list: callers heard "यह desk doctor
+# appointments book, check और reschedule करने के लिए है", which is a brochure read aloud,
+# not a person talking. One verb is what a receptionist actually says.
+_OUT_OF_SCOPE = (
+    "The caller wants something this desk does not do. This desk is for {purpose}. Tell "
+    "them that in one short sentence, in your own words, the way a receptionist would "
+    "say it to someone who has come to the wrong counter — name the one thing you do "
+    "and offer it. Do not list every variation of it, do not repeat the phrasing above "
+    "word for word, and do not say you did not understand: you did, and it is not "
+    "something you can help with. Do not ask them to repeat themselves."
+)
+
+_NO_REPEAT = (
+    "Your last reply was: {previous!r}. Do not say that sentence again, or any close "
+    "rewording of it. If the caller did not answer it, the words were the problem."
+)
+
+
+_CALLER_REPEATED = (
+    "The caller has just repeated themselves almost word for word. That means your "
+    "last reply missed what they asked for. Do not answer the same way again: say "
+    "briefly what you understood and ask them to confirm it, or ask what it is they "
+    "need. Do not carry on with the current step as though nothing happened."
+)
+
+
+def needs_scope_line(detected: IntentResult, no_match_streak: int) -> bool:
+    """Whether this turn should be told what the desk is for.
+
+    Only about *this* turn. The streak is a fallback for a caller the agent keeps
+    failing to read, and it used to fire on its own — so a caller whose third attempt
+    finally classified as a confident booking request was still told what the desk is
+    for, because the two before it had missed. Answering the turn in front of you is the
+    whole difference between a desk and a recording.
+    """
+    if detected.name == "out_of_scope":
+        return True
+    in_scope_now = detected.name not in ("unknown", "out_of_scope") and detected.is_confident
+    return no_match_streak >= 2 and not in_scope_now
+
+
+def _normalise(text: str) -> str:
+    """Lowercased words only, so 'apartment book cheyandi.' matches itself typed twice."""
+    return " ".join(re.sub(r"[^\w\s]", " ", text or "").lower().split())
+
+
+def _is_repeat(session: Session, user_text: str) -> bool:
+    """Whether this utterance is the caller saying their last one over again."""
+    said = _normalise(user_text)
+    if len(said.split()) < 2:
+        return False  # "yes" twice is agreement, not a repeat
+    for turn in reversed(session.history):
+        if turn.role is Role.USER:
+            return _normalise(turn.text) == said
+    return False
+
+
+_STUCK_ON = (
+    "This is the second unusable {slot} in a row, so asking the same way a third time "
+    "will not work either. Give them the options as a numbered choice - first, second - "
+    "and ask them to say a number. Do not read the list out again in the same words."
+)
+
+
+def _last_agent_line(session: Session) -> str:
+    """The previous thing the agent said, if there is one."""
+    for turn in reversed(session.history):
+        if turn.role is Role.AGENT:
+            return turn.text
+    return ""
+
+
+def _reask_note(slot: str, count: int) -> str:
+    """Tell the planner it is repeating itself, and how to not sound like it."""
+    spoken = slot.replace("_", " ")
+    template = _REASK.get(count, _REASK_LAST)
+    return template.format(slot=spoken, count=count)
 
 
 class Brain:
@@ -84,8 +192,22 @@ class Brain:
             self.subagent = None
 
         self.registry = registry or build_default_registry(self.subagent)
+        # Lines the planner does not write — greeting, handoff, identity — in whatever
+        # language the call turns out to be in. Written once per language, then read
+        # from disk forever after.
+        self.lines = LineBook(agent, self.llm)
         log.info("Deep reasoning %s", "enabled" if self.subagent else "disabled")
         self.store = store or InMemorySessionStore()
+
+    async def aclose(self) -> None:
+        """Release everything the brain holds open. Call when the call is over.
+
+        The subagent already had this; the LLM pools did not, and an un-closed pool is
+        what put an httpcore traceback after every run's summary.
+        """
+        if self.subagent is not None:
+            await self.subagent.aclose()
+        await self.llm.aclose()
 
     # --- session lifecycle -------------------------------------------------
 
@@ -96,6 +218,7 @@ class Brain:
             metadata=metadata,
         )
         self.store.put(session)
+        transcripts.call_started(session)
         return session
 
     def get(self, session_id: str) -> Session | None:
@@ -148,8 +271,48 @@ class Brain:
         stage_ms["intent"] = (time.perf_counter() - mark) * 1000
         yield IntentEvent(intent=detected)
 
-        session = session.with_slots(detected.slots)
+        # Validate before storing. A slot with a closed vocabulary is checked in the
+        # turn it is spoken; a rejected value never enters the session, and the planner
+        # is told to correct the caller in this same reply rather than three turns
+        # later when a tool finally refuses it.
+        kept, rejected = slot_mod.validate(
+            self.agent.validation_pairs, detected.slots, known=session.slots
+        )
+        notes = [slot_mod.note_for(r) for r in rejected]
+
+        # Twice on the same slot means the wording is the problem, not the caller.
+        # A caller offered two doctors typed "meeraa" and got the same list read back
+        # at them, twice - re-reading a list somebody has already failed to pick from
+        # is the least useful thing available.
+        if any(bad.slot == session.asked_slot for bad in rejected) and session.ask_repeats >= 2:
+            notes.append(_STUCK_ON.format(slot=session.asked_slot.replace(chr(95), chr(32))))
+        for bad in rejected:
+            log.info("Rejected %s=%r: %s", bad.slot, bad.said, bad.reason)
+        session = session.with_slots(kept)
+
+        # The classifier is not deterministic, and the demo cannot depend on it being
+        # lucky. Anything with a closed vocabulary that it missed is read straight out
+        # of the utterance - the word is either in the sheet or it is not.
+        session = session.with_slots(
+            slot_mod.recover(self.agent.validation_pairs, user_text, session.slots)
+        )
+        # "Am I talking to a machine?" — answered from the line book, not the planner.
+        # The answer is the same every time by design: it is the one line that must not
+        # vary with whatever a caller who keeps pushing talks the model into.
+        if detected.name == "asks_identity":
+            line = await self.lines.line("identity", session.language or self.agent.languages[0])
+            session = session.with_turn(Role.AGENT, line)
+            self.store.put(session)
+            yield SayEvent(text=line)
+            stage_ms["turn_total"] = (time.perf_counter() - started) * 1000
+            transcripts.turn(
+                session, user_text=user_text, agent_text=line, intent=detected, stage_ms=stage_ms
+            )
+            yield TimingEvent(stage_ms=stage_ms)
+            return
+
         session = self._track_no_match(session, detected)
+        session = self._track_off_topic(session, detected)
         session = self._track_abuse(session, detected)
         session = self._settle_language(session, detected, user_text)
 
@@ -167,14 +330,34 @@ class Brain:
                 yield event
             return
 
+        # A caller who wanted an apartment has the wrong number. They were told what
+        # this desk does on the previous turn; a second rewording of the same refusal
+        # helps nobody, and it is the shape a caller reads as a machine looping. Say so
+        # plainly and hang up — deterministically, with no model in the loop, because
+        # this is exactly the point at which a model keeps trying.
+        if session.off_topic_streak >= MAX_OFF_TOPIC_TURNS:
+            line = await self.lines.line("wrong_desk", session.language or self.agent.languages[0])
+            session = session.with_turn(Role.AGENT, line)
+            self.store.put(session)
+            yield SayEvent(text=line, is_final=True)
+            async for event in self._end(session, "off topic", outcome="wrong_desk"):
+                yield event
+            return
+
         # 3. Flow control — deterministic, no model involved.
         decision = next_node(self.agent, session, detected)
         if decision.force_end:
-            async for event in self._end(session, decision.reason):
+            async for event in self._end(
+                session, decision.reason, farewell=True, outcome="ended_by_caller"
+            ):
                 yield event
             return
         if decision.force_escalate or session.no_match_streak >= MAX_CONSECUTIVE_NO_MATCH:
-            reason = decision.reason or "repeated no-match"
+            # The flow's reason only describes an escalation the flow decided on. When
+            # the streak is what fired, decision.reason is whatever the flow was doing
+            # anyway — transcripts recorded "escalated: stay", which tells whoever reads
+            # them nothing about why the call left the agent.
+            reason = decision.reason if decision.force_escalate else "repeated no-match"
             async for event in self._escalate(session, reason):
                 yield event
             return
@@ -193,12 +376,48 @@ class Brain:
 
         # 4. Planner, streaming sentences out as they complete.
         node = self.agent.node(session.node_id)
+
+        # Which slot this turn is chasing, and whether we have chased it before. Asking
+        # the same question in the same words twice running is what makes a caller give
+        # up; the flow already knows it is happening, so the planner is told.
+        missing = node.missing_slots(session.slots)
+        target = missing[0] if missing else ""
+        session = session.asking_for(target)
+        # Never alongside a rejection. A correction and a rephrased re-ask are two
+        # instructions pulling the same sentence in different directions, and the model
+        # resolves that by doing neither properly. The correction owns the turn; the
+        # question it displaces is still unanswered next turn and will be asked then.
+        if target and session.ask_repeats > 1 and not rejected:
+            notes.append(_reask_note(target, session.ask_repeats))
+
+        # The caller is somewhere this agent cannot follow. Saying what the desk is for
+        # is the only thing that gets them unstuck; "I did not understand" is true and
+        # useless, and repeating it is what makes a caller give up on a machine.
+        if needs_scope_line(detected, session.no_match_streak):
+            notes.append(_OUT_OF_SCOPE.format(purpose=self.agent.purpose))
+
+        # The caller said the same thing again. A person hearing that assumes they
+        # misheard the first time; a model assumes the caller wants the same answer
+        # again, and hands it over. This is the one signal that reliably means an
+        # interpretation was wrong, and it needs no language to read.
+        if _is_repeat(history_before, user_text):
+            notes.append(_CALLER_REPEATED)
+
+        # Never say the same sentence twice running. Identical repetition is the single
+        # most machine-like thing in a transcript — more than any wording, more than any
+        # voice — and the model will do it unprompted, because from its side the prompt
+        # has barely changed.
+        previous = _last_agent_line(session)
+        if previous:
+            notes.append(_NO_REPEAT.format(previous=previous))
+
         mark = time.perf_counter()
         first_sentence_seen = False
         reply = ""
+        tools_used: list[dict[str, Any]] = []
 
         async for frame in planner.run(
-            self.llm, self.registry, self.agent, node, session, detected, user_text
+            self.llm, self.registry, self.agent, node, session, detected, user_text, notes
         ):
             if frame["type"] == "sentence":
                 if not first_sentence_seen:
@@ -208,6 +427,9 @@ class Brain:
             elif frame["type"] == "tool":
                 outcome = frame["outcome"]
                 session = self._adopt_canonical_slots(session, outcome)
+                tools_used.append(
+                    {"name": outcome.name, "ok": outcome.ok, "ms": round(outcome.ms)}
+                )
                 yield ToolEvent(
                     name=outcome.name, result=outcome.result, ok=outcome.ok, ms=outcome.ms
                 )
@@ -230,10 +452,25 @@ class Brain:
         self.store.put(session)
 
         stage_ms["turn_total"] = (time.perf_counter() - started) * 1000
+        transcripts.turn(
+            session,
+            user_text=user_text,
+            agent_text=reply,
+            intent=detected,
+            tools=tools_used,
+            stage_ms=stage_ms,
+        )
         yield TimingEvent(stage_ms=stage_ms)
 
         if node.terminal:
-            async for event in self._end(session, "flow reached a terminal step"):
+            # A booking confirmation is not a goodbye. The caller has just been given a
+            # reference code and then, on the old path, the line went dead — which reads
+            # as the desk hanging up on them the second their business was useful to it.
+            # The farewell is said here, deterministically, rather than left to the
+            # planner: the two-sentence cap eats a goodbye tacked onto a confirmation.
+            async for event in self._end(
+                session, "flow reached a terminal step", farewell=True, outcome="completed"
+            ):
                 yield event
 
     # --- helpers -----------------------------------------------------------
@@ -287,6 +524,12 @@ class Brain:
         if streak:
             log.info("Abusive turn %d in session %s", streak, session.session_id)
         return session.model_copy(update={"abuse_streak": streak})
+
+    def _track_off_topic(self, session: Session, detected: IntentResult) -> Session:
+        """Count consecutive turns about something this agent does not do."""
+        off = detected.name == "out_of_scope"
+        streak = session.off_topic_streak + 1 if off else 0
+        return session.model_copy(update={"off_topic_streak": streak})
 
     def _track_no_match(self, session: Session, detected: IntentResult) -> Session:
         missed = detected.name == "unknown" or not detected.is_confident
@@ -400,16 +643,38 @@ class Brain:
         # In the caller's language. An English sentence at the end of a Hindi call is
         # the most jarring moment in the conversation, and it lands exactly when the
         # caller is already unhappy.
-        line = spoken or phrases.handoff(session.language or self.agent.languages[0])
+        line = spoken or await self.lines.line(
+            "handoff", session.language or self.agent.languages[0]
+        )
         yield SayEvent(text=line, is_final=True)
         yield EscalateEvent(reason=reason)
-        self.store.put(
-            session.with_turn(Role.AGENT, line).model_copy(
-                update={"escalated": True, "ended": True}
-            )
+        session = session.with_turn(Role.AGENT, line).model_copy(
+            update={"escalated": True, "ended": True}
         )
+        self.store.put(session)
+        transcripts.call_ended(session, reason=reason, outcome="escalated")
 
-    async def _end(self, session: Session, reason: str) -> AsyncIterator[Event]:
+    async def _end(
+        self, session: Session, reason: str, *, farewell: bool = False, outcome: str = "ended"
+    ) -> AsyncIterator[Event]:
+        """Close the call.
+
+        ``farewell`` for every path that has not already said goodbye: a caller who
+        says no, and the caller whose booking just completed. Only the wrong-desk close
+        leaves it off, because that line says goodbye itself and two in a row is its own
+        kind of strange.
+        """
         self._release_subagent(session)
+        if farewell:
+            line = await self.lines.line(
+                "farewell", session.language or self.agent.languages[0]
+            )
+            session = session.with_turn(Role.AGENT, line)
+            yield SayEvent(text=line, is_final=True)
         yield EndEvent(reason=reason)
-        self.store.put(session.model_copy(update={"ended": True}))
+        session = session.model_copy(update={"ended": True})
+        self.store.put(session)
+        # What kind of ending, in the flow's own terms rather than the hospital's.
+        # Whether an appointment was booked is a domain question, and the tool calls and
+        # slots in the same file already answer it.
+        transcripts.call_ended(session, reason=reason, outcome=outcome)

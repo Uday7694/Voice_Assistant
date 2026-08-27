@@ -229,16 +229,32 @@ def test_the_planner_token_cap_is_tight_enough_for_two_sentences():
     assert PLANNER_MAX_TOKENS <= 200
 
 
-def test_each_language_names_its_script():
+def test_the_script_rule_is_stated_once_for_every_language():
     """Told only "Hindi", the model answers in romanised Hindi.
 
     That reads as Hindi to a person but reaches a TTS voice expecting Devanagari, which
-    then mispronounces it.
+    then mispronounces it. The rule used to be a table naming each script; it is now
+    one sentence, because every language here has exactly one script and a model that
+    knows the language knows which — including languages nobody listed.
     """
-    from brain.planner import _LANGUAGE_NAMES
+    from brain.planner import _SCRIPT_RULE
 
-    for tag in ("hi-IN", "te-IN", "ta-IN", "bn-IN", "pa-IN"):
-        assert "script" in _LANGUAGE_NAMES[tag], tag
+    assert "own script" in _SCRIPT_RULE
+    assert "Latin letters" in _SCRIPT_RULE
+
+
+def test_english_words_are_allowed_but_english_replies_are_not():
+    """Indian callers code-mix, and an agent that refuses to is the one that sounds odd.
+
+    "slot" and "cardiology" in a Telugu sentence is how people speak. A whole English
+    sentence on a Telugu call is the model dropping the language.
+    """
+    from brain.planner import _SCRIPT_RULE
+    from brain.script import is_wrong_language
+
+    assert "appointment" in _SCRIPT_RULE, "the rule names the loanwords it permits"
+    assert not is_wrong_language("రేపు ఉదయం పదికి slots ఉన్నాయి", "te-IN")
+    assert is_wrong_language("Which department do you need for the appointment?", "te-IN")
 
 
 def test_the_reply_language_instruction_forbids_transliteration():
@@ -254,8 +270,9 @@ def test_the_reply_language_instruction_forbids_transliteration():
         "mujhe appointment chahiye",
     )
     body = " ".join(m["content"] for m in messages)
-    assert "Devanagari" in body
-    assert "transliterate" in body
+    assert "Hindi" in body
+    assert "own script" in body
+    assert "Never write Hindi words in Latin letters" in body
 
 
 def test_the_classifier_is_told_the_step_does_not_constrain_the_caller():

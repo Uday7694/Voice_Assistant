@@ -6,7 +6,7 @@ authored through the dashboard's agent builder.
 
 from __future__ import annotations
 
-from ..flow import Agent, Node, Transition
+from ..flow import Agent, Node, SlotRule, Transition
 
 HOSPITAL_AGENT = Agent(
     name="apollo_front_desk",
@@ -26,12 +26,33 @@ HOSPITAL_AGENT = Agent(
         "billing disputes and insurance claims",
     ),
     refusal_line="I can book you in with a doctor who can answer that properly.",
+    purpose_line=(
+        "booking, checking and rescheduling doctor appointments at the hospital"
+    ),
+    # Checked at capture, not at tool time. "architecture" used to be accepted as a
+    # department and only refused three turns later, after the caller had given a name
+    # and heard slots read out.
+    slot_rules=(
+        SlotRule(slot="department", validator="department"),
+        SlotRule(slot="doctor", validator="doctor"),
+        SlotRule(slot="phone", validator="phone"),
+        # "Book it tomorrow" is a preference, not a choice of slot. Without this the
+        # flow moved on to the phone number with no time chosen, and the caller heard
+        # what time their appointment was for the first time in the SMS.
+        SlotRule(slot="slot", validator="slot"),
+    ),
     nodes=(
         Node(
             id="greet",
             goal="Greet the caller in one short line and ask how you can help.",
             expected_intents=(
                 "book_appointment",
+                # "Is the cardiology doctor free?" is not "what is my appointment?".
+                # Without an intent of its own it classified as check_appointment,
+                # which routes to lookup, which opens by asking for a phone number —
+                # so a caller with a general question was asked to identify himself
+                # before anyone had established he was a patient at all.
+                "check_availability",
                 "check_appointment",
                 "reschedule",
                 "provide_details",
@@ -40,6 +61,11 @@ HOSPITAL_AGENT = Agent(
             allowed_tools=("deep_reason",),
             transitions=(
                 Transition(when="book_appointment", to="collect_booking", reason="wants to book"),
+                Transition(
+                    when="check_availability",
+                    to="collect_booking",
+                    reason="asking what is free",
+                ),
                 Transition(when="check_appointment", to="lookup", reason="wants to check"),
                 Transition(when="reschedule", to="lookup", reason="wants to reschedule"),
                 # Nobody opens a call by stating a bare intent. "I need a cardiology
@@ -62,22 +88,54 @@ HOSPITAL_AGENT = Agent(
                 "at a time. Once you have both, offer available slots."
             ),
             required_slots=("patient_name", "department"),
-            expected_intents=("provide_details", "book_appointment", "change_department"),
+            expected_intents=(
+                "provide_details",
+                "book_appointment",
+                "check_availability",
+                "change_department",
+            ),
             # deep_reason handles the "which department do I even need?" questions that
             # the fast model should not answer from its own head.
             allowed_tools=("check_availability", "deep_reason"),
-            transitions=(Transition(when="slots_filled", to="offer_slots", reason="details collected"),),
+            transitions=(Transition(when="slots_filled", to="choose_doctor", reason="details collected"),),
             max_turns=6,
+        ),
+        Node(
+            # A caller who is told a time before being told whose time it is has been
+            # booked with a stranger. Naming the doctor is also the moment the hospital
+            # sounds like a hospital rather than a booking form: the fee, the
+            # experience and the languages they speak all live on this step.
+            id="choose_doctor",
+            goal=(
+                "Name the doctors available in this department, with one detail each - "
+                "seniority or languages, whichever helps - and ask which one they want. "
+                "If only one is available, say so and move on."
+            ),
+            required_slots=("doctor",),
+            expected_intents=(
+                "choose_doctor",
+                "provide_details",
+                "ask_doctor_details",
+                "change_department",
+            ),
+            allowed_tools=("find_doctors", "check_availability", "deep_reason"),
+            transitions=(
+                Transition(when="slots_filled", to="offer_slots", reason="doctor chosen"),
+                Transition(
+                    when="change_department", to="collect_booking", reason="wants another department"
+                ),
+            ),
+            max_turns=5,
         ),
         Node(
             id="offer_slots",
             goal=(
-                "Read out the available slots and ask the caller to pick one. Do not book "
-                "anything yet."
+                "Read out this doctor's open slots and ask the caller to pick one. Do not "
+                "book anything yet, and never offer a time the tool did not return."
             ),
             required_slots=("slot",),
             expected_intents=("choose_slot", "ask_other_times", "provide_details"),
-            allowed_tools=("check_availability", "deep_reason"),
+            allowed_tools=("check_availability", "find_doctors", "deep_reason"),
             transitions=(
                 Transition(when="slots_filled", to="collect_phone", reason="slot chosen"),
                 Transition(when="ask_other_times", to="offer_slots", reason="wants other options"),
@@ -104,9 +162,15 @@ HOSPITAL_AGENT = Agent(
             # one point in the call where they are ready to commit.
             id="confirm",
             goal=(
-                "Read back only the name, department and slot, then ask for a yes or no. "
-                "Do not repeat the phone number. Do not book anything at this step."
+                "Say exactly one sentence: the patient name, the doctor, the day and the "
+                "time, ending in 'shall I confirm?'. Nothing before it and nothing after "
+                "it. Do not repeat the phone number and do not book anything here."
             ),
+            # One sentence, enforced. Told to "read the details back, then ask for a yes
+            # or no", the model said "shall I say yes?" first and the details second — so
+            # the caller was asked to confirm before hearing what they were confirming,
+            # and the question they answered was about nothing.
+            max_sentences=1,
             expected_intents=("confirm_yes", "confirm_no", "change_slot"),
             transitions=(
                 Transition(when="confirm_yes", to="close", reason="caller confirmed"),
@@ -137,8 +201,10 @@ HOSPITAL_AGENT = Agent(
             id="close",
             goal=(
                 "Call book_appointment now, then read back the exact reference code it "
-                "returns, say an SMS is on its way, thank them and say goodbye. Never state "
-                "a reference code the tool did not give you."
+                "returns and the room number, and say an SMS is on its way. Never state a "
+                "reference code the tool did not give you. Do not say goodbye — the desk "
+                "closes the call itself, and a goodbye here would crowd out the room "
+                "number the caller actually needs."
             ),
             allowed_tools=("book_appointment",),
             terminal=True,

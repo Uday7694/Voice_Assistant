@@ -10,6 +10,8 @@ swearing the fastest way to skip the queue.
 from __future__ import annotations
 
 
+import pytest
+
 from brain.config import MAX_ABUSIVE_TURNS
 from brain.flow import next_node
 from brain.models import GLOBAL_INTENTS, IntentResult, Session
@@ -194,27 +196,58 @@ def test_an_ordinary_turn_carries_no_abuse_instruction():
 # --- handoff language ------------------------------------------------------
 
 
-def test_the_handoff_is_spoken_in_the_callers_language():
+@pytest.mark.asyncio
+async def test_the_handoff_is_spoken_in_the_callers_language(tmp_path):
     """An English sentence ending a Hindi call is the most jarring moment in it."""
-    from brain import phrases
+    from brain.lines import LineBook
 
-    assert phrases.handoff("hi-IN") != phrases.handoff("en-IN")
-    for tag in ("hi-IN", "te-IN", "ta-IN", "bn-IN"):
-        assert phrases.handoff(tag), tag
-
-
-def test_an_unknown_language_falls_back_rather_than_going_silent():
-    from brain import phrases
-
-    assert phrases.handoff("xx-XX") == phrases.HANDOFF["en-IN"]
-    assert phrases.handoff("") == phrases.HANDOFF["en-IN"]
+    book = LineBook(HOSPITAL_AGENT, _ScriptedWriter("संपर्क"), cache_dir=tmp_path)
+    assert await book.line("handoff", "hi-IN") == "संपर्क"
 
 
-def test_every_language_the_agent_speaks_has_a_handoff_line():
-    from brain import phrases
+@pytest.mark.asyncio
+async def test_an_unwritable_line_falls_back_rather_than_going_silent(tmp_path):
+    """No model, no network, no cache — the caller still hears something."""
+    from brain.lines import SPECS, LineBook
 
-    for tag in HOSPITAL_AGENT.languages:
-        assert tag in phrases.HANDOFF, tag
+    book = LineBook(HOSPITAL_AGENT, llm=None, cache_dir=tmp_path)
+    assert await book.line("handoff", "xx-XX") == SPECS["handoff"].fallback
+
+
+@pytest.mark.asyncio
+async def test_a_language_is_written_once_and_then_read_from_disk(tmp_path):
+    """The cost of a language is one call, ever — not one per call."""
+    from brain.lines import LineBook
+
+    writer = _ScriptedWriter("ఒకసారి")
+    book = LineBook(HOSPITAL_AGENT, writer, cache_dir=tmp_path)
+    await book.line("handoff", "te-IN")
+    assert writer.calls == 1
+
+    fresh = LineBook(HOSPITAL_AGENT, writer, cache_dir=tmp_path)
+    assert await fresh.line("handoff", "te-IN") == "ఒకసారి"
+    assert writer.calls == 1, "a language already on disk must not be written again"
+
+
+@pytest.mark.asyncio
+async def test_a_language_nobody_wrote_a_table_for_still_works(tmp_path):
+    """The point of the whole arrangement: adding a language is not a code change."""
+    from brain.lines import LineBook
+
+    book = LineBook(HOSPITAL_AGENT, _ScriptedWriter("ਸਤ ਸ੍ਰੀ ਅਕਾਲ"), cache_dir=tmp_path)
+    assert await book.line("opener", "pa-IN") == "ਸਤ ਸ੍ਰੀ ਅਕਾਲ"
+
+
+class _ScriptedWriter:
+    """An LLM that writes one known line, and counts how often it is asked to."""
+
+    def __init__(self, line: str) -> None:
+        self.line = line
+        self.calls = 0
+
+    async def json_call(self, messages, **kwargs):
+        self.calls += 1
+        return {"lines": [self.line]}
 
 
 def test_the_orchestrator_does_not_hard_code_the_handoff():

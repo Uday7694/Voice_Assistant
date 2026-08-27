@@ -16,11 +16,16 @@ import logging
 import os
 import struct
 from contextlib import suppress
+from dataclasses import replace
 from typing import AsyncIterator
 
 from sarvamai import AsyncSarvamAI
 
-from .types import WEB_SAMPLE_RATE, SpeechEvent
+from . import cache as audio_cache
+from .prosody import speakable
+from .warm import SocketWarmer
+from .types import TTS_SAMPLE_RATE, WEB_SAMPLE_RATE, SpeechEvent
+from .voice import VoiceProfile, profile_for
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +36,7 @@ TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
 # The SDK default speaker is "anushka", which is a bulbul:v2 voice. Pairing it with our
 # v3 default is rejected at configure time with a 422 before any audio is generated —
 # the two defaults are incompatible out of the box, so this must be set explicitly.
-DEFAULT_SPEAKER = os.getenv("SARVAM_SPEAKER", "priya")
+DEFAULT_SPEAKER = os.getenv("SARVAM_SPEAKER", "ishita")
 
 # Reported by the service in the 422 it raises on a mismatch. Kept here so a bad speaker
 # fails locally with the full list instead of costing a round trip to find out.
@@ -75,12 +80,71 @@ MIN_BUFFER_SIZE = int(os.getenv("SARVAM_MIN_BUFFER_SIZE", "50"))
 # Upper bound on one synthesis chunk. Caps how long a single burst can take.
 MAX_CHUNK_LENGTH = int(os.getenv("SARVAM_MAX_CHUNK_LENGTH", "150"))
 
+# Only meaningful for a compressed codec (mp3/opus); linear16 carries its own fixed
+# rate. Sent regardless so switching codec does not silently drop to the SDK default.
+TTS_BITRATE = os.getenv("SARVAM_TTS_BITRATE", "128k")
+
+
+def _tts_connect():
+    """Open a TTS socket. One place, so the warmer and a cold utterance agree."""
+    return client().text_to_speech_streaming.connect(
+        model=TTS_MODEL, send_completion_event="true"
+    )
+
+
+# Process-wide, because connections are per-process and a call does not own the pool.
+# Idle until `warm_tts()` is called, so nothing is opened by merely importing this.
+TTS_WARMER = SocketWarmer(_tts_connect)
+
+
+def warm_tts() -> None:
+    """Start keeping TTS connections ready.
+
+    Call it once the event loop is running and a call is plausible - at the top of a
+    call, or when the bridge accepts a connection. Costs one socket per pool slot and
+    saves roughly 600 ms on the first thing the agent says.
+    """
+    TTS_WARMER.start()
+
+
+async def close_tts_warmer() -> None:
+    await TTS_WARMER.aclose()
+
+
+# One SDK client per event loop, not one per connection.
+#
+# Constructing AsyncSarvamAI measured 357 ms — before a single packet moves, on every
+# utterance the agent speaks and every time the ear opens. It builds the HTTP client
+# stack underneath, and that work is identical every time. Reusing it is the largest
+# single latency win in the speech path and costs nothing but this dictionary.
+#
+# Keyed by loop rather than kept in one global because the client binds to the loop that
+# made it: a client built under one asyncio.run and used under the next fails in ways
+# that look like network flakiness. Tests create a loop per test, which is exactly where
+# that would have bitten.
+_CLIENTS: dict[int, AsyncSarvamAI] = {}
+
 
 def client() -> AsyncSarvamAI:
     key = os.getenv("SARVAM_API_KEY", "").strip()
     if not key:
         raise RuntimeError("SARVAM_API_KEY is not set.")
-    return AsyncSarvamAI(api_subscription_key=key)
+    try:
+        loop_id = id(asyncio.get_running_loop())
+    except RuntimeError:
+        # Called outside a loop — no reuse to be had, and no loop to key on.
+        return AsyncSarvamAI(api_subscription_key=key)
+
+    existing = _CLIENTS.get(loop_id)
+    if existing is None:
+        existing = AsyncSarvamAI(api_subscription_key=key)
+        _CLIENTS[loop_id] = existing
+    return existing
+
+
+def forget_clients() -> None:
+    """Drop cached clients. For tests, and for a process changing its API key."""
+    _CLIENTS.clear()
 
 
 # --- speech in ------------------------------------------------------------
@@ -207,22 +271,51 @@ class Mouth:
     One socket per utterance, deliberately. Sarvam's TTS WebSocket has no cancel
     message, so the only way to stop generation on barge-in is to close the connection —
     which means a long-lived shared socket cannot be interrupted.
+
+    That per-utterance socket is also what makes prosody possible: pace, pitch and
+    loudness are connection settings, so each line can be delivered differently
+    depending on what it is doing. Pass ``kind`` ("greeting", "readback", "apology",
+    "filler") and the voice adjusts the way a person's would.
     """
 
     def __init__(
         self,
         language: str = "en-IN",
         *,
-        speaker: str = DEFAULT_SPEAKER,
+        voice: str = "meera",
+        kind: str = "ask",
+        profile: VoiceProfile | None = None,
+        markers: tuple[str, ...] = (),
+        speaker: str | None = None,
         codec: str = "linear16",
-        sample_rate: int = WEB_SAMPLE_RATE,
-        pace: float = 1.0,
+        sample_rate: int = TTS_SAMPLE_RATE,
+        pace: float | None = None,
     ) -> None:
         self.language = language
-        self.speaker = speaker
+        self.kind = kind
+        # Words that read as throat-clearing in this call's language, so prosody knows
+        # where a beat belongs. Supplied by the caller because only the line book knows
+        # them, and only for the language actually being spoken.
+        self.markers = markers
+        # An explicit profile wins; otherwise the named voice decides, shaped by kind.
+        # `speaker` and `pace` stay as overrides for probes and A/B listening, where
+        # naming one voice against one line is the entire point.
+        base = profile or profile_for(voice, language, kind)
+        if speaker:
+            base = replace(base, speaker=speaker)
+        if pace is not None:
+            base = replace(base, pace=pace)
+        self.profile = base
         self.codec = codec
         self.sample_rate = sample_rate
-        self.pace = pace
+
+    @property
+    def speaker(self) -> str:
+        return self.profile.speaker
+
+    @property
+    def pace(self) -> float:
+        return self.profile.pace
 
     async def say(self, chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
         """Speak a stream of text, yielding audio as it is generated.
@@ -230,24 +323,32 @@ class Mouth:
         Takes an iterator rather than a string so the planner's sentences can be pushed
         in as they are produced — that overlap is where the perceived latency goes.
         """
-        check_speaker(self.speaker, TTS_MODEL)
-        ctx = client().text_to_speech_streaming.connect(
-            model=TTS_MODEL, send_completion_event="true"
-        )
-        async with ctx as socket:
+        check_speaker(self.profile.speaker, TTS_MODEL)
+
+        # A pre-opened connection when one is ready, otherwise open one here and wait.
+        # The utterance owns whichever it gets and closes it either way: barge-in works
+        # by closing the socket, so a shared one could not be interrupted.
+        warmed = TTS_WARMER.take()
+        ctx = warmed[0] if warmed else _tts_connect()
+        socket = warmed[1] if warmed else await ctx.__aenter__()
+
+        try:
             await socket.configure(
                 target_language_code=self.language,
-                speaker=self.speaker,
+                speaker=self.profile.speaker,
                 speech_sample_rate=self.sample_rate,
                 output_audio_codec=self.codec,
-                pace=self.pace,
+                output_audio_bitrate=TTS_BITRATE,
+                pace=self.profile.pace,
+                pitch=self.profile.pitch,
+                loudness=self.profile.loudness,
                 min_buffer_size=MIN_BUFFER_SIZE,
                 max_chunk_length=MAX_CHUNK_LENGTH,
             )
 
             # Text goes in on a background task while audio comes out here, so the
             # first frames play while later sentences are still being written.
-            sender = asyncio.create_task(_send_all(socket, chunks))
+            sender = asyncio.create_task(_send_all(socket, chunks, self.language, self.markers))
             try:
                 async for message in socket:
                     problem = _error_of(message)
@@ -262,22 +363,65 @@ class Mouth:
                 sender.cancel()
                 with suppress(asyncio.CancelledError):
                     await sender
+        finally:
+            # Always, and on every path: a normal finish, an error, and above all
+            # cancellation, which is what barge-in is. Closing the socket is both how the
+            # connection is released and how Bulbul is told to stop talking, so a missed
+            # close here is a leaked connection and an agent that will not shut up.
+            with suppress(Exception):
+                await ctx.__aexit__(None, None, None)
 
-    async def say_once(self, text: str) -> AsyncIterator[bytes]:
-        """Convenience wrapper for a single fixed line (greetings, hold phrases)."""
+    async def say_once(self, text: str, *, cache: bool = False) -> AsyncIterator[bytes]:
+        """Speak one fixed line (greeting, filler, handoff).
 
-        async def one() -> AsyncIterator[str]:
-            yield text
+        ``cache=True`` is for lines that are byte-identical on every call. The first
+        one pays for synthesis; every later one replays from disk at no credit cost and
+        no round trip, which is what makes a filler cheap enough to speak in the gap
+        before the planner has produced anything.
+        """
+        if not cache:
+            async for audio in self.say(_one(text)):
+                yield audio
+            return
 
-        async for audio in self.say(one()):
+        cache_key = audio_cache.key(
+            text,
+            speaker=self.profile.speaker,
+            language=self.language,
+            sample_rate=self.sample_rate,
+            pace=self.profile.pace,
+            pitch=self.profile.pitch,
+            loudness=self.profile.loudness,
+        )
+        stored = audio_cache.load(cache_key)
+        if stored is not None:
+            yield stored
+            return
+
+        collected = bytearray()
+        async for audio in self.say(_one(text)):
+            collected.extend(audio)
             yield audio
+        audio_cache.store(cache_key, bytes(collected))
 
 
-async def _send_all(socket, chunks: AsyncIterator[str]) -> None:
-    """Push text into the TTS socket as it arrives, then flush."""
+async def _one(text: str) -> AsyncIterator[str]:
+    yield text
+
+
+async def _send_all(
+    socket, chunks: AsyncIterator[str], language: str, markers: tuple[str, ...] = ()
+) -> None:
+    """Push text into the TTS socket as it arrives, then flush.
+
+    Prosody is applied here rather than in the planner. The planner writes what the
+    agent means; how it is broken up to be *said* is a property of speech, and putting
+    it here means every caller of Mouth gets it without knowing about it.
+    """
     async for text in chunks:
-        if text.strip():
-            await socket.convert(text)
+        spoken = speakable(text, language, markers)
+        if spoken:
+            await socket.convert(spoken)
     await socket.flush()
 
 

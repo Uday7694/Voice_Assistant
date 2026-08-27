@@ -51,7 +51,10 @@ def test_low_confidence_intent_does_not_move_the_conversation():
 def test_node_advances_once_required_slots_are_filled():
     session = _session("collect_booking", slots={"patient_name": "Asha", "department": "cardiology"})
     decision = next_node(HOSPITAL_AGENT, session, IntentResult(name="provide_details", confidence=0.9))
-    assert decision.node_id == "offer_slots"
+    # Name and department are not enough to offer a time: whose time it is comes first.
+    # A caller told "tomorrow at ten" without being told the doctor has been booked in
+    # with a stranger.
+    assert decision.node_id == "choose_doctor"
 
 
 def test_missing_slot_keeps_the_conversation_in_place():

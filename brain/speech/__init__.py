@@ -15,6 +15,7 @@ from .sarvam import Ear, Mouth, SarvamError
 from .types import (
     LANGUAGE_NAMES,
     TELEPHONY_SAMPLE_RATE,
+    TTS_SAMPLE_RATE,
     WEB_SAMPLE_RATE,
     SpeechEvent,
     bare_language,
@@ -30,6 +31,7 @@ __all__ = [
     "PROVIDER",
     "LANGUAGE_NAMES",
     "TELEPHONY_SAMPLE_RATE",
+    "TTS_SAMPLE_RATE",
     "WEB_SAMPLE_RATE",
     "bare_language",
 ]

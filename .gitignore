@@ -16,3 +16,11 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Synthesised audio for fixed lines (openers, fillers). Regenerated on demand, and
+# keyed on voice settings, so it is a cache and never a source of truth.
+.cache/
+
+# Call transcripts. Real conversations with real phone numbers in them: kept out of the
+# repository on purpose, and archived deliberately rather than by `git add`.
+logs/

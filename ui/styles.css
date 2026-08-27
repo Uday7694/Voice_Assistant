@@ -1,0 +1,124 @@
+/* Voice Desk console.
+   A control room, not a chat window: dark ground, one accent that means "live", and
+   type that stays readable while a call is moving. */
+
+:root {
+  --vd-ink:        #06080c;
+  --vd-panel:      #0d1219;
+  --vd-panel-soft: #121a24;
+  --vd-line:       #1e2936;
+  --vd-text:       #dce5f0;
+  --vd-muted:      #7b8b9e;
+  --vd-live:       #2ee6a8;
+  --vd-warn:       #ffb454;
+  --vd-alert:      #ff6b6b;
+  --vd-caller:     #6aa9ff;
+}
+
+.gradio-container {
+  background: var(--vd-ink) !important;
+  max-width: 100% !important;
+  font-feature-settings: "tnum" 1;
+}
+
+/* --- masthead ---------------------------------------------------------- */
+
+.vd-head {
+  display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+  padding: 18px 22px 16px;
+  border-bottom: 1px solid var(--vd-line);
+  background: linear-gradient(180deg, var(--vd-panel-soft), transparent);
+}
+.vd-head h1 {
+  margin: 0; font-size: 19px; font-weight: 650; letter-spacing: -0.01em;
+  color: var(--vd-text);
+}
+.vd-head .vd-sub { color: var(--vd-muted); font-size: 13px; }
+.vd-head .vd-spacer { flex: 1; }
+
+.vd-pill {
+  font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+  padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--vd-line); color: var(--vd-muted);
+  white-space: nowrap;
+}
+.vd-pill.live { color: var(--vd-live); border-color: color-mix(in oklab, var(--vd-live) 45%, transparent); }
+.vd-pill.live::before {
+  content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--vd-live); margin-right: 7px; vertical-align: middle;
+  animation: vd-pulse 1.8s ease-in-out infinite;
+}
+@keyframes vd-pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.25 } }
+
+/* --- panels ------------------------------------------------------------ */
+
+.vd-panel {
+  background: var(--vd-panel) !important;
+  border: 1px solid var(--vd-line) !important;
+  border-radius: 12px !important;
+}
+.vd-label {
+  font-size: 11px; letter-spacing: 0.09em; text-transform: uppercase;
+  color: var(--vd-muted); margin: 0 0 10px;
+}
+
+/* --- telemetry --------------------------------------------------------- */
+
+.vd-trace { font-size: 13px; line-height: 1.55; }
+.vd-trace .row {
+  display: flex; justify-content: space-between; gap: 14px;
+  padding: 7px 0; border-bottom: 1px dashed var(--vd-line);
+}
+.vd-trace .row:last-child { border-bottom: 0; }
+.vd-trace .k { color: var(--vd-muted); }
+.vd-trace .v { color: var(--vd-text); text-align: right; font-variant-numeric: tabular-nums; }
+.vd-trace .v.live  { color: var(--vd-live); }
+.vd-trace .v.warn  { color: var(--vd-warn); }
+.vd-trace .v.alert { color: var(--vd-alert); }
+.vd-trace .empty { color: var(--vd-muted); font-style: italic; }
+
+.vd-slots { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.vd-slots .chip {
+  font-size: 12px; padding: 3px 9px; border-radius: 7px;
+  background: var(--vd-panel-soft); border: 1px solid var(--vd-line);
+  color: var(--vd-text);
+}
+.vd-slots .chip b { color: var(--vd-muted); font-weight: 500; margin-right: 5px; }
+
+.vd-steps { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; }
+.vd-steps .step {
+  display: flex; align-items: center; gap: 9px;
+  font-size: 12.5px; color: var(--vd-muted); padding: 3px 0;
+}
+.vd-steps .step .bar {
+  height: 5px; border-radius: 3px; background: var(--vd-caller); min-width: 2px;
+}
+.vd-steps .step.slow .bar { background: var(--vd-warn); }
+.vd-steps .step .ms { color: var(--vd-text); font-variant-numeric: tabular-nums; }
+
+.vd-note { font-size: 12.5px; color: var(--vd-muted); margin-top: 12px; line-height: 1.5; }
+.vd-note.alert { color: var(--vd-alert); }
+
+/* --- the agent's voice -------------------------------------------------- */
+
+/* The player is rendered because a hidden one does not play, but it is furniture,
+   not content: no card, no chrome, just the transport and the waveform. */
+.vd-voice {
+  background: transparent !important;
+  border: 0 !important;
+  padding: 0 !important;
+}
+.vd-voice .controls,
+.vd-voice audio {
+  background: var(--vd-panel) !important;
+  border: 1px solid var(--vd-line) !important;
+  border-radius: 10px !important;
+}
+
+/* The agent's voice: our own element, kept to a slim transport bar. */
+.vd-quiet {
+  display: flex; align-items: center; gap: 12px;
+  min-height: 40px; padding: 4px 0;
+  color: var(--vd-muted); font-size: 12px;
+}
+.vd-quiet audio { flex: 1; height: 36px; }

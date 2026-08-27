@@ -27,6 +27,21 @@ class Transition(BaseModel):
     reason: str = ""
 
 
+class SlotRule(BaseModel):
+    """Bind a slot to a validator, by name.
+
+    A name rather than a callable because an Agent is configuration — in production a
+    row in Postgres, authored in a dashboard — and configuration cannot hold a function.
+    The validator itself is registered in `brain.slots` by whatever module owns the
+    vocabulary.
+    """
+
+    model_config = {"frozen": True}
+
+    slot: str
+    validator: str
+
+
 class Node(BaseModel):
     """One step of the conversation."""
 
@@ -43,6 +58,13 @@ class Node(BaseModel):
     max_turns: int = 6
     on_max_turns: str = "escalate"
     terminal: bool = False
+
+    max_sentences: int = 0
+    """How many sentences this step may speak, or 0 for the planner's own limit.
+
+    A step that reads details back and takes a yes or no is one sentence, and the
+    default of two is what let a confirmation arrive as "shall I say yes?" followed,
+    separately, by the details the caller was supposed to be saying yes to."""
 
     def missing_slots(self, slots: dict[str, str]) -> tuple[str, ...]:
         return tuple(s for s in self.required_slots if not slots.get(s))
@@ -62,6 +84,35 @@ class Agent(BaseModel):
     """Topics this agent must refuse outright, e.g. medical advice."""
 
     refusal_line: str = "I'm not able to help with that, but I can connect you to someone who can."
+
+    purpose_line: str = ""
+    """One plain sentence naming what this desk does, spoken to a caller who wants
+    something else. Separate from the persona because the persona is written for the
+    model and this is written to be said out loud."""
+
+    slot_rules: tuple[SlotRule, ...] = ()
+    """Slots whose value is checked the moment it is captured. A slot with a closed
+    vocabulary — a department, a phone number — must be rejected in the turn it is
+    spoken; catching it later means the caller has already answered questions that were
+    never going to lead anywhere."""
+
+    @property
+    def all_slots(self) -> tuple[str, ...]:
+        """Every slot this flow collects anywhere, in declaration order."""
+        seen: list[str] = []
+        for node in self.nodes:
+            for slot in node.required_slots:
+                if slot not in seen:
+                    seen.append(slot)
+        return tuple(seen)
+
+    @property
+    def purpose(self) -> str:
+        return self.purpose_line or "the service described in your role"
+
+    @property
+    def validation_pairs(self) -> tuple[tuple[str, str], ...]:
+        return tuple((rule.slot, rule.validator) for rule in self.slot_rules)
 
     def node(self, node_id: str) -> Node:
         for candidate in self.nodes:
@@ -103,7 +154,16 @@ def next_node(agent: Agent, session: Session, intent: IntentResult) -> FlowDecis
             node_id=current.id, changed=False, reason="user asked for a human", force_escalate=True
         )
 
-    if session.turns_in_node >= current.max_turns:
+    # The transition is matched first, and the turn budget only decides what happens
+    # when there is nowhere to go. The other order — budget first — throws away the one
+    # turn that was worth having: measured on a live call, the caller spent three turns
+    # being misread, said "schedule a sinus doctor" on the fourth, and was transferred to
+    # a person on the strength of the counter while a confident book_appointment with a
+    # department in it sat unused. A step is stuck when the caller is going nowhere, not
+    # when they have just said where they want to go.
+    target = _match_transition(current, session, intent)
+
+    if target is None and session.turns_in_node >= current.max_turns:
         if current.on_max_turns == "escalate":
             return FlowDecision(
                 node_id=current.id,
@@ -117,7 +177,6 @@ def next_node(agent: Agent, session: Session, intent: IntentResult) -> FlowDecis
             reason="max turns reached",
         )
 
-    target = _match_transition(current, session, intent)
     if target is None:
         return FlowDecision(node_id=current.id, changed=False, reason="stay")
     return FlowDecision(node_id=target.to, changed=target.to != current.id, reason=target.reason)

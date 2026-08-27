@@ -39,6 +39,11 @@ class Provider:
     sent, taking the fallback provider down with it.
     """
 
+    rank: int = 50
+    """Fallback order, lowest first. Measured time-to-first-token, not preference: a
+    provider is chosen as primary for the quality of what it says, but a *fallback* is
+    chosen because the primary is already failing and the caller is already waiting."""
+
     timeout_scale: float = 1.0
     """Multiplier on every timeout budget.
 
@@ -64,6 +69,7 @@ GROQ = Provider(
     fast_model=os.getenv("GROQ_FAST_MODEL", "openai/gpt-oss-20b"),
     # gpt-oss deliberates unless told not to; a voice turn cannot wait for it.
     extra_body={"reasoning_effort": os.getenv("GROQ_REASONING_EFFORT", "low")},
+    rank=10,
 )
 
 NVIDIA = Provider(
@@ -80,6 +86,7 @@ NVIDIA = Provider(
     # chain-of-thought into `content` itself — the agent literally said "We need to
     # follow instructions: greet in one short line" out loud. This turns it off.
     extra_body={"chat_template_kwargs": {"thinking": False}},
+    rank=20,
     timeout_scale=float(os.getenv("NVIDIA_TIMEOUT_SCALE", "3.0")),
 )
 
@@ -109,6 +116,7 @@ SARVAM = Provider(
     },
     # Measured 1.1-2.3 s per call against Groq's 0.3-0.6 s. The budgets are set for Groq,
     # so without headroom every turn times out and escalates.
+    rank=30,
     timeout_scale=float(os.getenv("SARVAM_TIMEOUT_SCALE", "2.5")),
 )
 
@@ -154,11 +162,21 @@ def resolve_fast(primary: Provider) -> Provider:
     return chosen if chosen.configured else primary
 
 
-def resolve_fallback(primary: Provider) -> Provider | None:
-    """The other configured provider, used when the primary fails mid-conversation."""
+def fallback_chain() -> tuple[Provider, ...]:
+    """Every configured provider, fastest first.
+
+    A chain rather than a single fallback, and ordered by measured speed rather than by
+    declaration order. The old version returned the first configured provider that was
+    not the *planner's* — which, with a Sarvam planner and a Groq classifier, was Groq
+    itself. A classifier timeout on Groq therefore retried on Groq, with the same budget
+    and the same overloaded endpoint, and the turn degraded to intent "unknown" twice
+    as slowly as it needed to.
+    """
     if os.getenv("LLM_FALLBACK", "1").strip() in {"0", "false", "no"}:
-        return None
-    for provider in PROVIDERS.values():
-        if provider.name != primary.name and provider.configured:
-            return provider
-    return None
+        return ()
+    return tuple(sorted((p for p in PROVIDERS.values() if p.configured), key=lambda p: p.rank))
+
+
+def resolve_fallback(primary: Provider) -> Provider | None:
+    """The fastest configured provider that is not ``primary``."""
+    return next((p for p in fallback_chain() if p.name != primary.name), None)

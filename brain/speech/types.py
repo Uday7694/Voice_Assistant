@@ -14,6 +14,11 @@ from typing import Literal
 TELEPHONY_SAMPLE_RATE = 8000
 WEB_SAMPLE_RATE = 16000
 
+# Output rate for synthesis. Independent of the capture rate above: the ear only needs
+# 16 kHz to transcribe, but bulbul:v3 renders at 24 kHz, and downsampling its output to
+# match the microphone throws away the top of the voice for nothing.
+TTS_SAMPLE_RATE = 24000
+
 
 @dataclass(frozen=True)
 class SpeechEvent:

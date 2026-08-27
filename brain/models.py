@@ -40,6 +40,11 @@ GLOBAL_INTENTS = (
     # the classifier reached for escalate_to_human and every insult transferred the call
     # instantly — which is both wrong and an easy way to skip the queue.
     "abusive",
+    # "Am I talking to a machine?" Global because it can be asked at any point, and an
+    # intent rather than a pattern match because the classifier already reads every
+    # utterance in every language this agent speaks — a regex would have to be written
+    # again for each one, and would still miss the phrasing nobody thought of.
+    "asks_identity",
 )
 
 
@@ -76,6 +81,18 @@ class Session(BaseModel):
     no_match_streak: int = 0
     abuse_streak: int = 0
     """Consecutive abusive turns. Reset by one ordinary turn: people cool down."""
+    off_topic_streak: int = 0
+    """Consecutive turns about something the agent does not do. Reset by one on-topic
+    turn: a caller who wandered and came back is not a wrong number."""
+
+    asked_slot: str = ""
+    """The slot the agent asked for last turn. Kept so a re-ask can be phrased as a
+    re-ask: repeating a question in identical words is the clearest signal a caller
+    gets that they are talking to a machine."""
+
+    ask_repeats: int = 0
+    """How many turns running the agent has asked for `asked_slot`."""
+
     ended: bool = False
     escalated: bool = False
     flagged: bool = False
@@ -91,6 +108,12 @@ class Session(BaseModel):
     def with_slots(self, new_slots: dict[str, str]) -> "Session":
         merged = {**self.slots, **{k: v for k, v in new_slots.items() if v}}
         return self.model_copy(update={"slots": merged})
+
+    def asking_for(self, slot: str) -> "Session":
+        """Record which slot this turn is chasing, counting consecutive attempts."""
+        if slot and slot == self.asked_slot:
+            return self.model_copy(update={"ask_repeats": self.ask_repeats + 1})
+        return self.model_copy(update={"asked_slot": slot, "ask_repeats": 1 if slot else 0})
 
     def at_node(self, node_id: str) -> "Session":
         if node_id == self.node_id:

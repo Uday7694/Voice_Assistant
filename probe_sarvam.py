@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from brain.speech.sarvam import WEB_SAMPLE_RATE, Ear, Mouth  # noqa: E402
+from brain.speech.sarvam import TTS_SAMPLE_RATE, WEB_SAMPLE_RATE, Ear, Mouth  # noqa: E402
 
 LINES = {
     "en-IN": "Your appointment with the cardiology department is confirmed for tomorrow morning.",
@@ -36,7 +36,7 @@ LINES = {
 
 async def synthesise(language: str, text: str) -> bytes:
     """Bulbul: text -> raw PCM, measuring time to the first audio frame."""
-    mouth = Mouth(language=language, codec="linear16", sample_rate=WEB_SAMPLE_RATE)
+    mouth = Mouth(language=language, codec="linear16", sample_rate=TTS_SAMPLE_RATE)
     started = time.perf_counter()
     first_ms = None
     pcm = bytearray()
@@ -47,7 +47,7 @@ async def synthesise(language: str, text: str) -> bytes:
         pcm.extend(frame)
 
     total_ms = (time.perf_counter() - started) * 1000
-    seconds = len(pcm) / (WEB_SAMPLE_RATE * 2)
+    seconds = len(pcm) / (TTS_SAMPLE_RATE * 2)
     print(f"  TTS  first frame {first_ms or -1:.0f} ms · total {total_ms:.0f} ms "
           f"· {len(pcm)} bytes ({seconds:.1f}s audio)")
     return bytes(pcm)
